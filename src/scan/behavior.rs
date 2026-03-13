@@ -1,3 +1,16 @@
+//! Behavioral detection layer for identifying suspicious runtime activity.
+//!
+//! This module detects anomalous process behavior that may indicate active
+//! compromise, including:
+//! - Reverse shells: shell processes with file descriptors redirected to
+//!   network sockets or pseudo-terminals (Linux), or shell processes with
+//!   established connections to non-loopback IPs (Windows).
+//! - Credential harvesting: recent access to /etc/shadow (Linux).
+//! - Suspicious parent processes: shell processes spawned by unexpected parents
+//!   on Windows, which may indicate an implant-spawned shell.
+//!
+//! Findings from this module are classified as `Tier::Behavioral` (weight 4).
+
 use std::path::Path;
 
 use crate::ScanResult;
@@ -34,6 +47,9 @@ pub fn is_shell_binary(path: &str) -> bool {
 /// destination of the fd and `is_socket` indicates the kernel reported the
 /// fd as a socket type.
 ///
+/// A shell with a socket fd typically means its stdin/stdout/stderr have been
+/// redirected over a network connection -- the hallmark of a reverse shell.
+///
 /// Returns a Behavioral Finding if the process is a shell with a socket fd.
 #[cfg(target_os = "linux")]
 pub fn check_fd_redirected_to_socket(
@@ -47,6 +63,11 @@ pub fn check_fd_redirected_to_socket(
         return None;
     }
 
+    // A socket fd is identified three ways:
+    //   1. The kernel flagged it as a socket type (is_socket == true)
+    //   2. The symlink target starts with "socket:" (e.g. "socket:[12345]")
+    //   3. The symlink target contains "ptmx" (pseudo-terminal master, used
+    //      by pty-based reverse shells)
     let has_socket = fds.iter().any(|(target, is_socket)| {
         *is_socket || target.starts_with("socket:") || target.contains("ptmx")
     });
@@ -63,7 +84,14 @@ pub fn check_fd_redirected_to_socket(
     }
 }
 
-/// Scan behavioral layer and return accumulated findings.
+/// Run all behavioral detection checks and return accumulated findings.
+///
+/// Platform-specific checks:
+/// - Linux: enumerates /proc to find shell processes with socket fds;
+///   checks /etc/shadow access time for credential harvesting.
+/// - Windows: checks shell processes for external TCP connections and
+///   suspicious parent processes.
+/// - BSD: stub (not yet implemented).
 pub fn scan(verbose: bool) -> ScanResult {
     let mut result = ScanResult::new();
 
@@ -96,11 +124,14 @@ pub fn scan(verbose: bool) -> ScanResult {
                     Err(_) => continue,
                 };
 
+                // Skip non-shell processes early to avoid expensive fd enumeration
                 if !is_shell_binary(&proc_name) {
                     continue;
                 }
 
-                // Enumerate file descriptors for this shell process
+                // Enumerate file descriptors for this shell process.
+                // Each fd is a symlink under /proc/<pid>/fd/ pointing to the
+                // underlying resource (file, socket, pipe, etc.).
                 let fd_dir = format!("/proc/{}/fd", pid);
                 let fds: Vec<(String, bool)> = match fs::read_dir(&fd_dir) {
                     Ok(entries) => entries
@@ -115,6 +146,7 @@ pub fn scan(verbose: bool) -> ScanResult {
                     Err(_) => continue,
                 };
 
+                // Convert owned strings to borrowed references for the check function
                 let fd_refs: Vec<(&str, bool)> =
                     fds.iter().map(|(s, b)| (s.as_str(), *b)).collect();
 
@@ -130,8 +162,9 @@ pub fn scan(verbose: bool) -> ScanResult {
             }
         }
 
-        // 2. Check /etc/shadow atime — if accessed in the last 60 seconds,
-        //    something read the shadow file recently (credential harvesting).
+        // 2. Check /etc/shadow atime -- if accessed in the last 60 seconds,
+        //    something read the shadow file recently. This is a strong indicator
+        //    of credential harvesting (e.g. `cat /etc/shadow` or password cracking).
         {
             let shadow_path = "/etc/shadow";
             if let Ok(meta) = fs::metadata(shadow_path) {
@@ -168,7 +201,8 @@ pub fn scan(verbose: bool) -> ScanResult {
         use crate::{Finding, Tier};
         use crate::platform::windows;
 
-        // Known legitimate parent processes for shell binaries on Windows
+        // Known legitimate parent processes for shell binaries on Windows.
+        // Shells spawned by processes NOT in this list are flagged as suspicious.
         const EXPECTED_PARENTS: &[&str] = &[
             "explorer.exe",
             "services.exe",
@@ -178,7 +212,7 @@ pub fn scan(verbose: bool) -> ScanResult {
             "conhost.exe",
         ];
 
-        // Windows shell binary names (lowercase for comparison)
+        // Windows shell binary names (lowercase for case-insensitive comparison)
         const WIN_SHELLS: &[&str] = &[
             "cmd.exe",
             "powershell.exe",
@@ -193,7 +227,7 @@ pub fn scan(verbose: bool) -> ScanResult {
             .map(|p| (p.pid, p.name.as_str()))
             .collect();
 
-        // Get TCP connections for network socket checks
+        // Get TCP connections to correlate with shell processes
         let connections = windows::read_tcp_connections();
 
         for proc_info in &procs {
@@ -202,13 +236,9 @@ pub fn scan(verbose: bool) -> ScanResult {
                 continue;
             }
 
-            // Check 1: Suspicious parent process
-            // PROCESSENTRY32 doesn't expose PPID directly through our ProcessInfo,
-            // so we rely on the network connection check below. For parent PID,
-            // we need to re-enumerate with parent tracking.
-            // For now, check if this shell PID has an ESTABLISHED connection
-            // to a non-loopback IP.
-
+            // Check if this shell PID has an ESTABLISHED TCP connection
+            // to a non-loopback IP. This pattern (shell + external connection)
+            // strongly suggests a reverse shell or remote access tool.
             let shell_connections: Vec<&windows::WindowsTcpConnection> = connections
                 .iter()
                 .filter(|c| c.owning_pid == proc_info.pid && c.state == "ESTABLISHED")
@@ -248,8 +278,8 @@ pub fn scan(verbose: bool) -> ScanResult {
             }
         }
 
-        // Re-enumerate with parent PID tracking for suspicious parent detection
-        // Use CreateToolhelp32Snapshot which gives us th32ParentProcessID
+        // Re-enumerate with parent PID tracking for suspicious parent detection.
+        // Uses CreateToolhelp32Snapshot which exposes th32ParentProcessID.
         check_shell_parents_windows(&procs, &pid_to_name, verbose, &mut result);
     }
 
@@ -265,8 +295,11 @@ pub fn scan(verbose: bool) -> ScanResult {
 }
 
 /// Check shell processes for suspicious parent processes on Windows.
+///
 /// Uses CreateToolhelp32Snapshot to get parent PIDs, then flags shells whose
-/// parent is not a known legitimate Windows process.
+/// parent is not in the expected parents list. An unexpected parent (e.g. a
+/// webserver or random executable spawning cmd.exe) indicates an implant or
+/// exploit may have spawned a shell.
 #[cfg(windows)]
 fn check_shell_parents_windows(
     procs: &[crate::platform::ProcessInfo],
@@ -280,6 +313,8 @@ fn check_shell_parents_windows(
     };
     use windows_sys::Win32::Foundation::CloseHandle;
 
+    // Extended expected parents list including common legitimate shell parents.
+    // SSH daemons and existing shells are expected to spawn new shells.
     const EXPECTED_PARENTS: &[&str] = &[
         "explorer.exe",
         "services.exe",
@@ -312,6 +347,7 @@ fn check_shell_parents_windows(
 
         if Process32First(snapshot, &mut entry) != 0 {
             loop {
+                // Extract null-terminated process name from the fixed-size char array
                 let name = entry
                     .szExeFile
                     .iter()
@@ -322,12 +358,14 @@ fn check_shell_parents_windows(
                 let lower_name = name.to_lowercase();
                 if WIN_SHELLS.contains(&lower_name.as_str()) {
                     let ppid = entry.th32ParentProcessID;
+                    // Look up the parent process name from our PID map
                     let parent_name = pid_to_name
                         .get(&ppid)
                         .copied()
                         .unwrap_or("unknown");
                     let parent_lower = parent_name.to_lowercase();
 
+                    // Flag if parent is not in the expected list
                     if !EXPECTED_PARENTS.contains(&parent_lower.as_str()) {
                         if verbose {
                             eprintln!(

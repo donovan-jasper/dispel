@@ -1,3 +1,16 @@
+//! dispel — host-based detection and remediation library for the Realm C2 framework.
+//!
+//! This crate provides multi-layer scanning for Realm C2 (imix agent) artifacts:
+//! - **proc**: binary inspection via Aho-Corasick string matching and SHA256 hashes
+//! - **net**: suspicious network connections (known C2 ports, DNS tunneling)
+//! - **persist**: persistence mechanisms (beacon IDs, systemd units, registry keys)
+//! - **behavior**: runtime anomalies (reverse shells, credential harvesting)
+//! - **memory**: live process memory scanning for implant signatures
+//!
+//! Findings are scored by tier (T1–T3 + Behavioral) and aggregated into an
+//! overall severity (CLEAN / SUSPECT / DETECTED). Output formats include
+//! human-readable terminal, JSON, CEF syslog, and webhook.
+
 pub mod signatures;
 pub mod output;
 pub mod scan;

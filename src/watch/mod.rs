@@ -1,3 +1,15 @@
+//! Continuous monitoring mode with deduplication.
+//!
+//! Watch mode runs scan layers in a polling loop and reports only new or
+//! recurring findings. Deduplication suppresses identical findings for a
+//! configurable window (default 300s) to avoid alert fatigue.
+//!
+//! Features:
+//! - Optional baseline period: learns existing findings before alerting.
+//! - Memory scan throttling: runs the memory scan layer every Nth iteration
+//!   to reduce CPU overhead (memory scanning is expensive).
+//! - Output to human-readable terminal, JSON lines, CEF syslog, and/or webhook.
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -6,8 +18,15 @@ use crate::Layer;
 use crate::output::{human, json, syslog};
 use crate::{scan, Finding, ScanResult};
 
+/// Tracks which findings have been reported recently to suppress duplicates.
+///
+/// Each entry maps a dedup key (layer + description) to:
+/// - `first_seen`: when the finding was first observed
+/// - `last_reported`: when the finding was last emitted as an alert
+/// - `weight`: the tier weight of the finding (unused currently, reserved for scoring)
 struct DedupTracker {
     seen: HashMap<String, (Instant, Instant, u32)>,
+    /// How long to suppress a finding after it was last reported.
     suppress_duration: Duration,
 }
 
@@ -19,6 +38,10 @@ impl DedupTracker {
         }
     }
 
+    /// Return true if this finding should be reported (not suppressed).
+    ///
+    /// A finding is suppressed if it was reported within the last `suppress_duration`.
+    /// Otherwise, it is marked as reported and returns true.
     fn should_report(&mut self, finding: &Finding) -> bool {
         let key = finding.dedup_key();
         let now = Instant::now();
@@ -33,6 +56,8 @@ impl DedupTracker {
         true
     }
 
+    /// Remove stale entries that are older than 2x the suppress duration.
+    /// Prevents the dedup map from growing unboundedly in long-running sessions.
     fn cleanup(&mut self) {
         let now = Instant::now();
         self.seen.retain(|_, (first_seen, _, _)| {
@@ -41,6 +66,19 @@ impl DedupTracker {
     }
 }
 
+/// Run continuous monitoring in a polling loop. Never returns under normal
+/// operation (loops forever until Ctrl+C).
+///
+/// # Arguments
+/// - `layer`: optional layer filter; None = scan all layers.
+/// - `interval_secs`: seconds between scan iterations.
+/// - `baseline_secs`: if Some, sleep this long then run one scan to learn
+///   existing findings before entering the alert loop.
+/// - `json_output`: emit JSON lines instead of colored terminal output.
+/// - `allowlist`: finding suppression rules.
+/// - `syslog_enabled`: also send findings to local syslog (UDP 127.0.0.1:514).
+/// - `webhook_url`: also POST findings as JSON to this HTTP URL.
+/// - `verbose`: enable diagnostic output on stderr.
 pub fn run(
     layer: Option<&Layer>,
     interval_secs: u64,
@@ -58,6 +96,9 @@ pub fn run(
         eprintln!("dispel watch mode (interval={}s, Ctrl+C to stop)", interval_secs);
     }
 
+    // Optional baseline phase: run one scan and feed all findings into the
+    // dedup tracker so they are treated as "already known" and won't alert
+    // on the first real iteration.
     if let Some(baseline) = baseline_secs {
         if !json_output {
             eprintln!("Baselining for {}s...", baseline);
@@ -72,6 +113,8 @@ pub fn run(
         }
     }
 
+    // Memory scans are expensive. Only run them every MEMORY_SCAN_EVERY iterations
+    // to keep CPU usage reasonable during continuous monitoring.
     let mut memory_scan_counter: u64 = 0;
     const MEMORY_SCAN_EVERY: u64 = 6;
 
@@ -82,6 +125,7 @@ pub fn run(
         let mut result = run_scan_layers(layer, verbose, skip_memory);
         result.filter(allowlist);
 
+        // Only report findings that pass the dedup check
         for finding in &result.findings {
             if dedup.should_report(finding) {
                 if json_output {
@@ -103,6 +147,10 @@ pub fn run(
     }
 }
 
+/// Execute the requested scan layers and return a merged result.
+///
+/// If `skip_memory` is true, the memory scan layer is skipped even if
+/// requested, to reduce CPU overhead in watch mode.
 fn run_scan_layers(layer: Option<&Layer>, verbose: bool, skip_memory: bool) -> ScanResult {
     let mut result = ScanResult::new();
 

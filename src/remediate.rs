@@ -1,34 +1,75 @@
 //! Remediation module: detect, quarantine, and remove Realm C2 implants.
 //!
-//! This module is the backend for `dispel kill`. It:
-//!   1. Runs the proc scan to detect implants
-//!   2. Generates an IR report for context
-//!   3. For each detected implant: quarantines the binary, kills PIDs,
-//!      removes the binary, and scrubs persistence artifacts
+//! This module is the backend for `dispel kill`. It performs a four-phase
+//! remediation sequence for each detected implant:
+//!
+//!   1. **Scan** -- Runs the proc scanner to identify implant processes via
+//!      behavioral and signature-based heuristics (see `scan::proc`).
+//!   2. **Report** -- Generates an incident-response report that groups raw
+//!      findings into resolved implant records (binary path + associated PIDs).
+//!   3. **Quarantine** -- Copies the implant binary to a forensic quarantine
+//!      directory (named by SHA-256 prefix) before any destructive action.
+//!   4. **Eradicate** -- Kills/terminates implant processes, deletes the binary
+//!      from disk, and scrubs persistence mechanisms (systemd units, SysV init
+//!      scripts, Windows services, registry keys, beacon ID files).
+//!
+//! All destructive operations respect `KillConfig::dry_run` so that operators
+//! can preview actions before committing. Exit codes follow the convention:
+//!   - 0 = system clean, no implants found
+//!   - 1 = unsupported platform
+//!   - 2 = implants detected (and killed, unless dry-run)
+//!   - 3 = internal error (propagated via `anyhow`)
+//!
+//! Platform support: Linux (via `libc::kill` + systemd/sysvinit cleanup) and
+//! Windows (via `windows-sys` `TerminateProcess` + `sc.exe`/`reg.exe` cleanup).
 
 use std::path::PathBuf;
 #[cfg(any(target_os = "linux", windows))]
 use std::path::Path;
 
-// ANSI color helpers — no dep needed
+// ---------------------------------------------------------------------------
+// ANSI color helpers -- lightweight terminal coloring without pulling in a
+// dependency like `colored`. Each wraps the input string in an escape sequence
+// and resets afterward.
+// ---------------------------------------------------------------------------
+
+/// Wrap `s` in ANSI green (used for success messages).
 fn green(s: &str) -> String {
     format!("\x1b[32m{}\x1b[0m", s)
 }
+
+/// Wrap `s` in ANSI red (used for errors and alerts).
 fn red(s: &str) -> String {
     format!("\x1b[31m{}\x1b[0m", s)
 }
+
+/// Wrap `s` in ANSI yellow (used for warnings and dry-run labels).
 fn yellow(s: &str) -> String {
     format!("\x1b[33m{}\x1b[0m", s)
 }
 
-/// Configuration for a kill run.
+// ---------------------------------------------------------------------------
+// Kill configuration
+// ---------------------------------------------------------------------------
+
+/// Configuration for a remediation ("kill") run.
+///
+/// Passed through to every remediation helper so each can check `dry_run`
+/// and resolve the quarantine directory consistently.
 pub struct KillConfig {
+    /// When true, print what *would* happen without modifying the system.
     pub dry_run: bool,
+    /// Directory where implant binaries are copied before deletion.
+    /// Defaults to `/var/lib/dispel/quarantine` (Linux) or
+    /// `C:\ProgramData\dispel\quarantine` (Windows).
     pub quarantine_dir: PathBuf,
+    /// Emit extra diagnostic output to stderr.
     pub verbose: bool,
 }
 
 impl KillConfig {
+    /// Build a new `KillConfig`, selecting the platform-appropriate default
+    /// quarantine directory if none is provided.
     pub fn new(dry_run: bool, quarantine_dir: Option<PathBuf>, verbose: bool) -> Self {
         let qdir = quarantine_dir.unwrap_or_else(|| {
             #[cfg(windows)]
@@ -44,8 +85,16 @@ impl KillConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Top-level dispatch
+// ---------------------------------------------------------------------------
+
 /// Entry point for `dispel kill`.
-/// Returns an exit code: 0 = clean, 2 = implants found/killed, 3 = error.
+///
+/// Dispatches to the platform-specific implementation. Returns an exit code:
+///   - 0 = clean (no implants found)
+///   - 1 = unsupported platform
+///   - 2 = implants found and acted upon (or would be, in dry-run mode)
 pub fn run_kill(cfg: &KillConfig) -> anyhow::Result<i32> {
     #[cfg(target_os = "linux")]
     {
@@ -57,21 +106,31 @@ pub fn run_kill(cfg: &KillConfig) -> anyhow::Result<i32> {
         return run_kill_windows(cfg);
     }
 
+    // Fallback for macOS, BSDs, etc. -- scanning is not implemented there.
     #[cfg(not(any(target_os = "linux", windows)))]
     {
-        let _ = cfg;
+        let _ = cfg; // suppress unused-variable warning on unsupported platforms
         eprintln!("{}", red("Kill command is only supported on Linux and Windows."));
         return Ok(1);
     }
 }
 
+// ===========================================================================
+// Linux kill implementation
+// ===========================================================================
+
+/// Linux-specific remediation pipeline.
+///
+/// Runs the proc scanner, generates an IR report, then for each resolved
+/// implant: quarantines the binary, kills its PIDs, deletes it, and removes
+/// persistence artifacts.
 #[cfg(target_os = "linux")]
 fn run_kill_linux(cfg: &KillConfig) -> anyhow::Result<i32> {
     use crate::ir::generate_report;
     use crate::scan;
     use crate::Severity;
 
-    // Step 1: run proc scan
+    // Phase 1: scan /proc for implant indicators
     let result = scan::proc::scan(cfg.verbose);
 
     if result.severity == Severity::Clean {
@@ -79,11 +138,15 @@ fn run_kill_linux(cfg: &KillConfig) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    // Step 2: generate IR report for forensic context
+    // Phase 2: generate IR report -- this correlates raw findings into
+    // implant records with resolved binary paths and associated PIDs
     let report = generate_report(&result);
 
     if report.implants.is_empty() {
-        // Findings exist but no resolved implant paths — print findings and exit
+        // The scanner found suspicious indicators but could not resolve them
+        // to a concrete binary path. This can happen when the implant deletes
+        // itself after exec or when /proc/<pid>/exe is unreadable. Print the
+        // raw findings so the operator can investigate manually.
         println!(
             "{} {} finding(s), but no binary paths resolved. Manual investigation required.",
             yellow("WARNING:"),
@@ -105,23 +168,27 @@ fn run_kill_linux(cfg: &KillConfig) -> anyhow::Result<i32> {
     }
     println!();
 
-    // Step 3: act on each implant
+    // Phase 3: remediate each implant in sequence
     for implant in &report.implants {
         println!("--- {}", implant.summary_line());
         println!();
 
         let pids: Vec<u32> = implant.processes.iter().map(|p| p.pid).collect();
 
-        // a) Quarantine
+        // (a) Quarantine -- preserve a copy for forensic analysis before
+        //     any destructive action. Must happen before kill, because
+        //     killing the process may cause the kernel to release the
+        //     last reference to a deleted-but-open binary.
         quarantine_binary(cfg, &implant.path, &pids);
 
-        // b) Kill processes
+        // (b) Kill -- SIGKILL all associated PIDs to stop C2 communication
         kill_processes(cfg, &pids, &implant.path);
 
-        // c) Remove binary
+        // (c) Delete -- remove the binary from disk so it cannot be re-exec'd
         remove_binary(cfg, &implant.path);
 
-        // d) Remove persistence
+        // (d) Persistence -- scrub systemd units, sysvinit scripts, and
+        //     beacon ID files that would re-spawn the implant on reboot
         remove_persistence(cfg);
 
         println!();
@@ -131,13 +198,21 @@ fn run_kill_linux(cfg: &KillConfig) -> anyhow::Result<i32> {
 }
 
 /// Copy the implant binary to the quarantine directory before destruction.
-/// Falls back to /proc/<pid>/exe if the file is already gone from disk.
+///
+/// The quarantine filename is `<sha256_prefix_16>_<original_basename>` to
+/// avoid collisions while keeping the original name visible.
+///
+/// If the binary has already been unlinked from the filesystem (common with
+/// Realm's self-delete behavior), falls back to reading via `/proc/<pid>/exe`
+/// which remains valid as long as the process holds an open fd.
 #[cfg(target_os = "linux")]
 fn quarantine_binary(cfg: &KillConfig, binary_path: &str, pids: &[u32]) {
     use sha2::{Digest, Sha256};
     use std::fs;
 
-    // Determine source path — prefer the real file, fall back to /proc/<pid>/exe
+    // Determine source path: prefer the on-disk file, fall back to the
+    // /proc/<pid>/exe symlink which the kernel keeps alive while the
+    // process is running even if the file is unlinked.
     let source = if Path::new(binary_path).exists() {
         binary_path.to_string()
     } else if let Some(&pid) = pids.first() {
@@ -164,7 +239,9 @@ fn quarantine_binary(cfg: &KillConfig, binary_path: &str, pids: &[u32]) {
         return;
     };
 
-    // Compute sha256 for the quarantine filename
+    // Read the binary and compute SHA-256 for the quarantine filename.
+    // Reading the full file into memory is acceptable since implant
+    // binaries are typically small (< 50 MB).
     let hash = match fs::read(&source) {
         Ok(data) => {
             let mut h = Sha256::new();
@@ -182,11 +259,14 @@ fn quarantine_binary(cfg: &KillConfig, binary_path: &str, pids: &[u32]) {
         }
     };
 
+    // Extract the original filename for human-readable quarantine naming
     let basename = Path::new(binary_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Use first 16 hex chars of SHA-256 as prefix -- enough to be unique
+    // while keeping filenames manageable
     let dest_name = format!("{}_{}", &hash[..16], basename);
     let dest = cfg.quarantine_dir.join(&dest_name);
 
@@ -200,7 +280,7 @@ fn quarantine_binary(cfg: &KillConfig, binary_path: &str, pids: &[u32]) {
         return;
     }
 
-    // Create quarantine directory if it doesn't exist
+    // Ensure the quarantine directory tree exists
     if let Err(e) = fs::create_dir_all(&cfg.quarantine_dir) {
         println!(
             "  {} quarantine: cannot create dir {} — {}",
@@ -230,6 +310,10 @@ fn quarantine_binary(cfg: &KillConfig, binary_path: &str, pids: &[u32]) {
 }
 
 /// Send SIGKILL to all PIDs associated with the implant.
+///
+/// Uses `libc::kill(2)` directly rather than shelling out, for reliability
+/// and to avoid spawning a child process that the implant could intercept.
+/// SIGKILL is chosen over SIGTERM because malware can trap SIGTERM.
 #[cfg(target_os = "linux")]
 fn kill_processes(cfg: &KillConfig, pids: &[u32], binary_path: &str) {
     if pids.is_empty() {
@@ -251,11 +335,14 @@ fn kill_processes(cfg: &KillConfig, pids: &[u32], binary_path: &str) {
             continue;
         }
 
-        // SAFETY: kill(2) with SIGKILL — standard Unix operation
+        // SAFETY: kill(2) with SIGKILL is a standard POSIX operation.
+        // The cast to pid_t is safe because we only store valid u32 PIDs
+        // and pid_t is i32 on Linux (max PID is 2^22 by default).
         let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         if ret == 0 {
             println!("  {} SIGKILL -> PID {}", green("OK"), pid);
         } else {
+            // Common failures: ESRCH (process already exited), EPERM (not root)
             let err = std::io::Error::last_os_error();
             println!("  {} kill PID {} — {}", red("ERROR"), pid, err);
         }
@@ -263,6 +350,10 @@ fn kill_processes(cfg: &KillConfig, pids: &[u32], binary_path: &str) {
 }
 
 /// Delete the implant binary from disk.
+///
+/// Called after quarantine and kill so the binary cannot be re-exec'd by a
+/// persistence mechanism (cron, systemd restart, etc.). If the file is
+/// already gone (e.g., self-deleting implant), this is a no-op.
 #[cfg(target_os = "linux")]
 fn remove_binary(cfg: &KillConfig, binary_path: &str) {
     let p = Path::new(binary_path);
@@ -283,17 +374,32 @@ fn remove_binary(cfg: &KillConfig, binary_path: &str) {
     }
 }
 
-/// Remove persistence artifacts: beacon ID files, systemd units, sysvinit script.
+/// Remove Linux persistence artifacts left by Realm C2 implants.
+///
+/// Targets three categories of persistence:
+///   - **Beacon ID files**: unique host identifiers written to well-known
+///     paths that the C2 server uses to track compromised hosts.
+///   - **Systemd units**: service files that auto-restart the implant.
+///     After removal, triggers `systemctl daemon-reload` so systemd
+///     picks up the change immediately.
+///   - **SysV init script**: legacy init persistence for non-systemd hosts.
+///
+/// Paths are defined in `signatures::strings` to keep them in sync with
+/// the detection scanner.
 #[cfg(target_os = "linux")]
 fn remove_persistence(cfg: &KillConfig) {
     use crate::signatures::strings::{BEACON_ID_PATHS_LINUX, SYSTEMD_PATHS, SYSVINIT_PATH};
 
-    // Beacon ID files
+    // Beacon ID files -- removing these forces the implant (if somehow
+    // restarted) to re-register with the C2, which is noisier and gives
+    // defenders another detection opportunity.
     for path in BEACON_ID_PATHS_LINUX {
         remove_file_if_exists(cfg, path, "beacon ID file");
     }
 
-    // Systemd unit files
+    // Systemd unit files -- track whether any were removed so we only
+    // call daemon-reload when necessary (avoids spurious warnings on
+    // systems where systemd is not running).
     let mut removed_systemd = false;
     for path in SYSTEMD_PATHS {
         if remove_file_if_exists(cfg, path, "systemd unit") {
@@ -301,15 +407,20 @@ fn remove_persistence(cfg: &KillConfig) {
         }
     }
 
+    // Reload systemd if we removed (or would remove in dry-run) any units
     if removed_systemd || cfg.dry_run {
         reload_systemd(cfg);
     }
 
-    // SysV init script
+    // SysV init script -- single well-known path
     remove_file_if_exists(cfg, SYSVINIT_PATH, "sysvinit script");
 }
 
-/// Delete a file if it exists. Returns true if the file existed and was removed (or would be).
+/// Delete a file if it exists, with dry-run support and labeled output.
+///
+/// Returns `true` if the file existed and was removed (or would be in
+/// dry-run mode). Used by `remove_persistence` to track whether any
+/// systemd units were cleaned up.
 #[cfg(target_os = "linux")]
 fn remove_file_if_exists(cfg: &KillConfig, path: &str, label: &str) -> bool {
     if !Path::new(path).exists() {
@@ -333,7 +444,11 @@ fn remove_file_if_exists(cfg: &KillConfig, path: &str, label: &str) -> bool {
     }
 }
 
-/// Run `systemctl daemon-reload` after removing systemd units.
+/// Run `systemctl daemon-reload` to force systemd to re-read its unit
+/// file directories after we removed implant service files.
+///
+/// Non-fatal: logs a warning instead of failing if systemd is unavailable
+/// (e.g., container environments, SysV-only hosts).
 #[cfg(target_os = "linux")]
 fn reload_systemd(cfg: &KillConfig) {
     if cfg.dry_run {
@@ -356,6 +471,8 @@ fn reload_systemd(cfg: &KillConfig) {
             );
         }
         Err(e) => {
+            // This is expected in containers or on SysV-only hosts where
+            // systemctl is not available. Not a hard failure.
             println!(
                 "  {} systemctl daemon-reload — {} (systemd may not be present)",
                 yellow("WARN"),
@@ -365,17 +482,24 @@ fn reload_systemd(cfg: &KillConfig) {
     }
 }
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
 // Windows kill implementation
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
+/// Windows-specific remediation pipeline.
+///
+/// Mirrors the Linux flow but uses Windows-native APIs and tools:
+///   - `TerminateProcess` via `windows-sys` instead of `kill(2)`
+///   - `sc.exe` for service management instead of systemd
+///   - `reg.exe` for registry cleanup (Realm stores config in `HKLM\SOFTWARE\Imix`)
+///   - No /proc fallback for quarantine (Windows does not expose exe via procfs)
 #[cfg(windows)]
 fn run_kill_windows(cfg: &KillConfig) -> anyhow::Result<i32> {
     use crate::ir::generate_report;
     use crate::scan;
     use crate::Severity;
 
-    // Step 1: run proc scan
+    // Phase 1: scan for implant processes
     let result = scan::proc::scan(cfg.verbose);
 
     if result.severity == Severity::Clean {
@@ -383,10 +507,12 @@ fn run_kill_windows(cfg: &KillConfig) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    // Step 2: generate IR report for forensic context
+    // Phase 2: generate IR report to correlate findings into implant records
     let report = generate_report(&result);
 
     if report.implants.is_empty() {
+        // Findings exist but no binary paths could be resolved -- the
+        // operator needs to investigate manually.
         println!(
             "{} {} finding(s), but no binary paths resolved. Manual investigation required.",
             yellow("WARNING:"),
@@ -408,23 +534,24 @@ fn run_kill_windows(cfg: &KillConfig) -> anyhow::Result<i32> {
     }
     println!();
 
-    // Step 3: act on each implant
+    // Phase 3: remediate each implant
     for implant in &report.implants {
         println!("--- {}", implant.summary_line());
         println!();
 
         let pids: Vec<u32> = implant.processes.iter().map(|p| p.pid).collect();
 
-        // a) Quarantine
+        // (a) Quarantine -- no /proc fallback on Windows; if the binary
+        //     is not on disk, quarantine is skipped.
         quarantine_binary_windows(cfg, &implant.path);
 
-        // b) Terminate processes
+        // (b) Terminate -- TerminateProcess with exit code 1
         terminate_processes_windows(cfg, &pids, &implant.path);
 
-        // c) Remove binary
+        // (c) Delete the binary from disk
         remove_binary_windows(cfg, &implant.path);
 
-        // d) Remove persistence
+        // (d) Persistence -- registry keys, services, beacon ID files
         remove_persistence_windows(cfg);
 
         println!();
@@ -434,6 +561,10 @@ fn run_kill_windows(cfg: &KillConfig) -> anyhow::Result<i32> {
 }
 
 /// Copy the implant binary to the quarantine directory on Windows.
+///
+/// Unlike the Linux variant, there is no `/proc/<pid>/exe` fallback. If the
+/// binary has been deleted from disk, quarantine is skipped and the operator
+/// is notified.
 #[cfg(windows)]
 fn quarantine_binary_windows(cfg: &KillConfig, binary_path: &str) {
     use sha2::{Digest, Sha256};
@@ -448,7 +579,7 @@ fn quarantine_binary_windows(cfg: &KillConfig, binary_path: &str) {
         return;
     }
 
-    // Compute sha256 for the quarantine filename
+    // Read the binary and compute SHA-256 for the quarantine filename
     let hash = match fs::read(binary_path) {
         Ok(data) => {
             let mut h = Sha256::new();
@@ -466,11 +597,13 @@ fn quarantine_binary_windows(cfg: &KillConfig, binary_path: &str) {
         }
     };
 
+    // Extract the original filename for human-readable naming
     let basename = Path::new(binary_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // First 16 hex chars of SHA-256 prefix + original name
     let dest_name = format!("{}_{}", &hash[..16], basename);
     let dest = cfg.quarantine_dir.join(&dest_name);
 
@@ -484,6 +617,7 @@ fn quarantine_binary_windows(cfg: &KillConfig, binary_path: &str) {
         return;
     }
 
+    // Ensure the quarantine directory tree exists
     if let Err(e) = fs::create_dir_all(&cfg.quarantine_dir) {
         println!(
             "  {} quarantine: cannot create dir {} — {}",
@@ -512,7 +646,14 @@ fn quarantine_binary_windows(cfg: &KillConfig, binary_path: &str) {
     }
 }
 
-/// Terminate processes on Windows using TerminateProcess via windows-sys.
+/// Terminate processes on Windows using the Win32 `TerminateProcess` API.
+///
+/// Opens each PID with `PROCESS_TERMINATE` access, then calls
+/// `TerminateProcess` with exit code 1. The handle is always closed
+/// afterward, even on failure.
+///
+/// Requires the calling process to have `SeDebugPrivilege` or be running
+/// as Administrator to terminate elevated processes.
 #[cfg(windows)]
 fn terminate_processes_windows(cfg: &KillConfig, pids: &[u32], binary_path: &str) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -539,7 +680,12 @@ fn terminate_processes_windows(cfg: &KillConfig, pids: &[u32], binary_path: &str
             continue;
         }
 
+        // SAFETY: Win32 API calls with proper handle management.
+        // OpenProcess returns NULL on failure; we check before using.
+        // CloseHandle is called unconditionally after TerminateProcess.
         unsafe {
+            // Request a handle with only PROCESS_TERMINATE rights
+            // (principle of least privilege)
             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
             if handle.is_null() {
                 let err = std::io::Error::last_os_error();
@@ -547,9 +693,11 @@ fn terminate_processes_windows(cfg: &KillConfig, pids: &[u32], binary_path: &str
                 continue;
             }
 
+            // Exit code 1 signals abnormal termination
             let ret = TerminateProcess(handle, 1);
             CloseHandle(handle);
 
+            // TerminateProcess returns nonzero on success (Win32 BOOL convention)
             if ret != 0 {
                 println!("  {} TerminateProcess -> PID {}", green("OK"), pid);
             } else {
@@ -561,6 +709,10 @@ fn terminate_processes_windows(cfg: &KillConfig, pids: &[u32], binary_path: &str
 }
 
 /// Delete the implant binary from disk on Windows.
+///
+/// Called after quarantine and terminate. If the file is locked by another
+/// process, deletion will fail with a sharing violation -- the operator
+/// should verify all implant processes were terminated.
 #[cfg(windows)]
 fn remove_binary_windows(cfg: &KillConfig, binary_path: &str) {
     let p = Path::new(binary_path);
@@ -581,15 +733,24 @@ fn remove_binary_windows(cfg: &KillConfig, binary_path: &str) {
     }
 }
 
-/// Remove persistence artifacts on Windows: registry keys, services, beacon ID files.
+/// Remove Windows persistence artifacts left by Realm C2 implants.
+///
+/// Targets three categories:
+///   1. **Registry keys**: Realm's "Imix" variant stores configuration under
+///      `HKLM\SOFTWARE\Imix`. Removed via `reg.exe delete /f`.
+///   2. **Windows services**: Realm registers itself as a Windows service
+///      for auto-start persistence. Stopped via `sc.exe stop`, then
+///      deleted via `sc.exe delete`.
+///   3. **Beacon ID files**: host-unique identifier files at well-known
+///      Windows paths (e.g., `C:\ProgramData\...`).
 #[cfg(windows)]
 fn remove_persistence_windows(cfg: &KillConfig) {
     use crate::signatures::strings::{BEACON_ID_PATHS_WINDOWS, TIER1_SERVICE_NAMES};
 
-    // 1. Delete registry key HKLM\SOFTWARE\Imix
+    // 1. Delete the Imix registry key (stores C2 config/callback URL)
     remove_registry_key_windows(cfg, r"SOFTWARE\Imix");
 
-    // 2. Stop and delete Windows services
+    // 2. Stop and delete each known implant service
     for svc_name in TIER1_SERVICE_NAMES {
         stop_and_delete_service_windows(cfg, svc_name);
     }
@@ -600,14 +761,19 @@ fn remove_persistence_windows(cfg: &KillConfig) {
     }
 }
 
-/// Delete a registry key using reg.exe.
+/// Delete a registry key under HKLM using `reg.exe`.
+///
+/// First queries whether the key exists (via `reg.exe query`) to avoid
+/// noisy error output for keys that were never created. Uses `/f` to
+/// force deletion without confirmation prompt.
 #[cfg(windows)]
 fn remove_registry_key_windows(cfg: &KillConfig, subkey: &str) {
     use std::process::Command;
 
     let full_key = format!(r"HKLM\{}", subkey);
 
-    // Check if the key exists first
+    // Probe for the key's existence before attempting deletion.
+    // reg.exe query returns success (0) if the key exists.
     let query = Command::new("reg.exe")
         .args(["query", &full_key])
         .output();
@@ -618,7 +784,7 @@ fn remove_registry_key_windows(cfg: &KillConfig, subkey: &str) {
     };
 
     if !exists {
-        return;
+        return; // Key does not exist -- nothing to do
     }
 
     if cfg.dry_run {
@@ -630,6 +796,7 @@ fn remove_registry_key_windows(cfg: &KillConfig, subkey: &str) {
         return;
     }
 
+    // /f = force deletion without interactive confirmation
     match Command::new("reg.exe")
         .args(["delete", &full_key, "/f"])
         .status()
@@ -656,12 +823,19 @@ fn remove_registry_key_windows(cfg: &KillConfig, subkey: &str) {
     }
 }
 
-/// Stop and delete a Windows service using sc.exe.
+/// Stop and delete a Windows service using `sc.exe`.
+///
+/// The service is first queried to confirm it exists. If it does, we stop
+/// it (ignoring errors since it may already be stopped) and then delete it.
+/// Deletion removes the service entry from the SCM database so it will not
+/// start on next boot.
 #[cfg(windows)]
 fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
     use std::process::Command;
 
-    // Check if the service exists
+    // Query the service to determine if it exists. sc.exe query prints the
+    // service state; we check for any recognized state string rather than
+    // relying on the exit code alone (which can be ambiguous).
     let query = Command::new("sc.exe")
         .args(["query", svc_name])
         .output();
@@ -669,6 +843,8 @@ fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
     let exists = match query {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
+            // Any of these states confirms the service is registered in
+            // the Service Control Manager database.
             stdout.contains("RUNNING")
                 || stdout.contains("STOPPED")
                 || stdout.contains("PAUSED")
@@ -679,7 +855,7 @@ fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
     };
 
     if !exists {
-        return;
+        return; // Service not registered -- skip
     }
 
     if cfg.dry_run {
@@ -691,7 +867,8 @@ fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
         return;
     }
 
-    // Stop the service (ignore errors — it may already be stopped)
+    // Stop the service first. Ignore non-zero exit -- the service may
+    // already be in STOPPED state, which causes sc.exe to return an error.
     let stop_result = Command::new("sc.exe")
         .args(["stop", svc_name])
         .output();
@@ -701,7 +878,7 @@ fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
             println!("  {} stopped service '{}'", green("OK"), svc_name);
         }
         Ok(_) => {
-            // Service might already be stopped, that's fine
+            // Non-zero exit is expected if the service was already stopped
             if cfg.verbose {
                 eprintln!("[remediate] sc.exe stop {} returned non-zero (may already be stopped)", svc_name);
             }
@@ -711,7 +888,8 @@ fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
         }
     }
 
-    // Delete the service
+    // Delete the service entry from the SCM database. This prevents the
+    // implant from being started again via the service manager.
     match Command::new("sc.exe")
         .args(["delete", svc_name])
         .status()
@@ -738,7 +916,9 @@ fn stop_and_delete_service_windows(cfg: &KillConfig, svc_name: &str) {
     }
 }
 
-/// Delete a file if it exists on Windows.
+/// Delete a file if it exists on Windows, with dry-run support.
+///
+/// Returns `true` if the file existed and was removed (or would be).
 #[cfg(windows)]
 fn remove_file_if_exists_windows(cfg: &KillConfig, path: &str, label: &str) -> bool {
     if !Path::new(path).exists() {

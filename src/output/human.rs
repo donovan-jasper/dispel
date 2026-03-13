@@ -1,7 +1,22 @@
+//! Colored terminal output for scan results and incident response reports.
+//!
+//! This module renders findings and IR reports to stdout with ANSI color codes
+//! via the `colored` crate. Color coding is based on detection tier:
+//! - Tier1 (name-based): yellow
+//! - Tier2 (strong indicator): orange
+//! - Tier3 (conclusive): red
+//! - Behavioral: magenta
+//!
+//! Overall severity is shown as a colored banner: green (CLEAN), yellow
+//! (SUSPECT), or red (DETECTED).
+
 use colored::Colorize;
 use crate::{Finding, ScanResult, Severity, Tier};
 
 /// Print a full scan result to stdout with colored terminal formatting.
+///
+/// Shows the overall severity status banner, score, individual findings
+/// (if any), and a summary line.
 pub fn print_result(result: &ScanResult) {
     let header = match result.severity {
         Severity::Clean => "  CLEAN  ".on_green().black().bold(),
@@ -32,7 +47,9 @@ pub fn print_result(result: &ScanResult) {
     println!();
 }
 
-/// Print a single finding with colored tier label.
+/// Print a single finding with a colored tier label.
+///
+/// Format: `[T1] [layer] description -- detail`
 pub fn print_finding(finding: &Finding) {
     let tier_label = format_tier_label(&finding.tier);
     println!(
@@ -44,7 +61,9 @@ pub fn print_finding(finding: &Finding) {
     );
 }
 
-/// Print a finding alert for watch mode, including a timestamp.
+/// Print a finding alert for watch mode, prefixed with a UNIX timestamp.
+///
+/// Format: `[epoch] ALERT [T1] [layer] description -- detail`
 pub fn print_alert(finding: &Finding) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -61,9 +80,16 @@ pub fn print_alert(finding: &Finding) {
     );
 }
 
-/// Print an IR report in human-readable format.
+/// Print a full incident response report in human-readable colored format.
+///
+/// For each detected implant, renders sections for:
+/// - File info (SHA256, size, owner, timestamps, permissions)
+/// - Extracted config (C2 callback URIs, beacon ID, interval, public keys)
+/// - Running processes (PID, parent, user, cmdline, cwd, start time, env)
+/// - Network connections (state, local/remote addresses, PID)
+/// - Persistence mechanisms (systemd, registry, etc.)
 pub fn print_ir_report(report: &crate::ir::IrReport) {
-    
+
 
     if report.implants.is_empty() {
         println!("  No implant binaries to report on.");
@@ -82,7 +108,7 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
         );
         println!("  {}", implant.summary_line().yellow().bold());
 
-        // File info
+        // File metadata section
         if let Some(ref fi) = implant.file_info {
             println!();
             println!("  {}", "File Info:".cyan().bold());
@@ -95,7 +121,7 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
             println!("    Created:     {}", fi.created);
         }
 
-        // Extracted config
+        // Extracted configuration section (compiled-in values from the binary)
         if let Some(ref config) = implant.extracted_config {
             if !config.callback_uris.is_empty() || config.beacon_id.is_some() {
                 println!();
@@ -118,7 +144,7 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
             }
         }
 
-        // Processes
+        // Running processes section
         if !implant.processes.is_empty() {
             println!();
             println!("  {}", "Running Processes:".cyan().bold());
@@ -140,11 +166,12 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
             }
         }
 
-        // Network connections
+        // Network connections section
         if !implant.connections.is_empty() {
             println!();
             println!("  {}", "Network Connections:".cyan().bold());
             for conn in &implant.connections {
+                // Color-code connection state for quick visual triage
                 let state_colored = match conn.state.as_str() {
                     "ESTABLISHED" => conn.state.green().to_string(),
                     "SYN_SENT" => conn.state.yellow().to_string(),
@@ -165,7 +192,7 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
             println!("    (none found — binary may be dormant or connections already closed)");
         }
 
-        // Persistence
+        // Persistence mechanisms section
         if !implant.persistence.is_empty() {
             println!();
             println!("  {}", "Persistence:".cyan().bold());
@@ -180,11 +207,12 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
     println!();
 }
 
+/// Format a tier label with the appropriate color for terminal output.
 fn format_tier_label(tier: &Tier) -> colored::ColoredString {
     let label = format!("[{}]", tier.label());
     match tier {
         Tier::Tier1 => label.yellow().bold(),
-        Tier::Tier2 => label.truecolor(255, 140, 0).bold(), // orange
+        Tier::Tier2 => label.truecolor(255, 140, 0).bold(), // orange (true color)
         Tier::Tier3 => label.red().bold(),
         Tier::Behavioral => label.magenta().bold(),
     }

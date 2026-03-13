@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use dispel::Layer;
 
-/// Realm C2 detection tool for CCDC blue team operations.
+/// Realm C2 detection and remediation tool.
 #[derive(Debug, Parser)]
 #[command(name = "dispel", version, about)]
 pub struct Cli {

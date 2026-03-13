@@ -1,13 +1,44 @@
+//! Live process memory scanner for Realm C2 implant detection.
+//!
+//! This module complements filesystem-based binary scanning by inspecting the
+//! memory of running processes. It detects indicators that persist even when the
+//! on-disk binary has been deleted, packed, or was never written to disk at all
+//! (fileless execution). The scanner operates on both Linux and Windows, using
+//! platform-specific APIs to enumerate processes and read their virtual memory.
+//!
+//! Detection techniques implemented here:
+//!
+//! 1. **Process masquerading** -- detects when a process's actual executable
+//!    (`/proc/<pid>/exe`) differs from what it reports as `argv[0]`, which is a
+//!    common evasion tactic used by implants to blend in with legitimate services.
+//!
+//! 2. **Suspicious environment variables** -- checks each process's environment
+//!    block for variables with prefixes associated with IMIX (Realm's implant) or
+//!    generic C2 beacon configuration.
+//!
+//! 3. **Memory map analysis** -- parses `/proc/<pid>/maps` to flag anonymous RWX
+//!    regions (code injection), memfd-backed executable mappings (fileless exec),
+//!    and shared libraries loaded from world-writable or hidden directories.
+//!
+//! 4. **memfd file descriptor detection** -- enumerates `/proc/<pid>/fd/` for open
+//!    memfd handles, which are used for in-memory-only payload staging.
+//!
+//! 5. **In-memory signature scanning** -- reads process memory via `pread(2)` (Linux)
+//!    or `ReadProcessMemory` (Windows) and runs Aho-Corasick pattern matching against
+//!    known Realm/IMIX byte sequences. A per-process threshold of 3+ unique matches
+//!    is required to suppress false positives from incidental string presence.
+//!
+//! 6. **Thread start address analysis** (Windows only) -- queries each thread's start
+//!    address via `NtQueryInformationThread` and flags threads originating from
+//!    non-image (private) memory, a hallmark of reflective injection.
+
 use crate::{Finding, ScanResult, Tier};
 
-/// Scan for in-memory indicators of Realm C2 implants.
-/// This goes beyond filesystem-based binary scanning to detect:
-/// - Signatures in live process memory (catches deleted/packed binaries)
-/// - Anonymous executable memory regions (fileless execution)
-/// - Process masquerading (exe vs cmdline mismatch)
-/// - memfd-based execution
-/// - Suspicious shared library load paths
-/// - IMIX-related environment variables
+/// Top-level entry point for the memory scanner.
+///
+/// Dispatches to the platform-specific implementation based on compile target.
+/// Skips the calling process (`self_pid`) to avoid self-detection.
+/// When `verbose` is true, diagnostic messages are written to stderr.
 pub fn scan(verbose: bool) -> ScanResult {
     let mut result = ScanResult::new();
     let self_pid = std::process::id();
@@ -22,6 +53,7 @@ pub fn scan(verbose: bool) -> ScanResult {
         scan_windows(&mut result, self_pid, verbose);
     }
 
+    // Suppress "unused variable" warnings on platforms where neither cfg applies.
     let _ = (verbose, self_pid);
     result
 }
@@ -30,6 +62,10 @@ pub fn scan(verbose: bool) -> ScanResult {
 // Linux implementation
 // ---------------------------------------------------------------------------
 
+/// Iterates over `/proc` to enumerate all running processes and applies each
+/// detection technique in sequence. Each check is independent -- a failure
+/// to read one proc file (e.g., due to permissions) does not prevent other
+/// checks from running on the same process.
 #[cfg(target_os = "linux")]
 fn scan_linux(result: &mut ScanResult, self_pid: u32, verbose: bool) {
     use crate::scan::proc::BinaryScanner;
@@ -46,19 +82,23 @@ fn scan_linux(result: &mut ScanResult, self_pid: u32, verbose: bool) {
         let fname = entry.file_name();
         let fname_str = fname.to_string_lossy();
 
+        // Only numeric directory names correspond to PIDs; skip everything else
+        // (e.g., /proc/self, /proc/net, /proc/sys).
         let pid: u32 = match fname_str.parse() {
             Ok(n) => n,
             Err(_) => continue,
         };
 
-        // Skip self
+        // Avoid scanning ourselves -- our own memory contains the signature
+        // patterns we're searching for, which would cause a false positive.
         if pid == self_pid {
             continue;
         }
 
         let pid_path = format!("/proc/{}", pid);
 
-        // Get process name for reporting
+        // Read the short process name from /proc/<pid>/comm (max 16 chars,
+        // kernel-truncated). Used in findings for human-readable identification.
         let proc_name = fs::read_to_string(format!("{}/comm", pid_path))
             .unwrap_or_default()
             .trim()
@@ -79,9 +119,10 @@ fn scan_linux(result: &mut ScanResult, self_pid: u32, verbose: bool) {
         // 4. memfd file descriptor detection
         check_memfd_fds(result, pid, &pid_path, &proc_name, verbose);
 
-        // 5. Process memory scanning for signatures
-        // Skip common service processes whose heap may contain our own scan output
-        // (e.g., sshd contains our output text when we run through SSH)
+        // 5. Process memory scanning for Realm/IMIX byte signatures.
+        // Terminal multiplexers and session managers (sshd, tmux, screen, etc.)
+        // are skipped because their PTY buffers often contain our own scan
+        // output text, leading to false positives.
         if let Some(ref regions) = maps {
             let skip_mem_scan = matches!(
                 proc_name.as_str(),
@@ -94,46 +135,71 @@ fn scan_linux(result: &mut ScanResult, self_pid: u32, verbose: bool) {
     }
 }
 
-/// Memory region parsed from /proc/<pid>/maps.
+/// A single contiguous memory region parsed from `/proc/<pid>/maps`.
+///
+/// Each line in the maps file describes one VMA (virtual memory area) with its
+/// address range, permission flags, and optional backing file path.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct MemRegion {
+    /// Start address of the mapping (inclusive).
     start: u64,
+    /// End address of the mapping (exclusive).
     end: u64,
+    /// Permission string from the kernel, e.g. "rwxp" or "r--s".
+    /// Characters: r/-, w/-, x/-, p(rivate)/s(hared).
     perms: String,
+    /// Backing file path, or empty string for anonymous mappings.
+    /// May also be a pseudo-path like "[heap]", "[stack]", or "/memfd:name".
     pathname: String,
 }
 
 #[cfg(target_os = "linux")]
 impl MemRegion {
+    /// Whether the region has the read permission bit set (position 0).
     fn is_readable(&self) -> bool {
         self.perms.starts_with('r')
     }
 
+    /// Whether the region has the execute permission bit set (position 2).
     fn is_executable(&self) -> bool {
         self.perms.len() >= 3 && self.perms.as_bytes()[2] == b'x'
     }
 
+    /// Whether the region has the write permission bit set (position 1).
     fn is_writable(&self) -> bool {
         self.perms.len() >= 2 && self.perms.as_bytes()[1] == b'w'
     }
 
+    /// Anonymous mappings have no backing file -- their pathname field is empty.
+    /// These are heap allocations, mmap(MAP_ANONYMOUS) regions, etc.
     fn is_anonymous(&self) -> bool {
         self.pathname.is_empty()
     }
 
+    /// memfd regions use the `memfd_create(2)` syscall for in-memory file-like
+    /// objects. The kernel displays these as "/memfd:<name>" or "memfd:<name>".
     fn is_memfd(&self) -> bool {
         self.pathname.starts_with("/memfd:")
             || self.pathname.starts_with("memfd:")
     }
 
+    /// File-backed regions have a real filesystem path (starts with '/') but
+    /// are NOT memfd pseudo-paths.
     fn is_file_backed(&self) -> bool {
         self.pathname.starts_with('/')
             && !self.is_memfd()
     }
 }
 
-/// Parse /proc/<pid>/maps into memory regions.
+/// Parse `/proc/<pid>/maps` into a vector of [`MemRegion`] structs.
+///
+/// Returns `None` if the maps file cannot be read (process exited, or
+/// insufficient permissions). Each line in the file has the format:
+/// ```text
+/// address           perms offset  dev   inode   pathname
+/// 7f8a1c000000-7f8a1c021000 rw-p 00000000 00:00 0    [heap]
+/// ```
 #[cfg(target_os = "linux")]
 fn parse_maps(pid_path: &str) -> Option<Vec<MemRegion>> {
     use std::fs;
@@ -142,7 +208,7 @@ fn parse_maps(pid_path: &str) -> Option<Vec<MemRegion>> {
     let mut regions = Vec::new();
 
     for line in content.lines() {
-        // Format: addr-addr perms offset dev inode pathname
+        // Split into at most 6 fields; the 6th (pathname) may contain spaces.
         let parts: Vec<&str> = line.splitn(6, char::is_whitespace).collect();
         if parts.len() < 2 {
             continue;
@@ -151,12 +217,14 @@ fn parse_maps(pid_path: &str) -> Option<Vec<MemRegion>> {
         let addr_range = parts[0];
         let perms = parts[1].to_string();
 
+        // Pathname is optional -- anonymous mappings omit it entirely.
         let pathname = if parts.len() >= 6 {
             parts[5].trim().to_string()
         } else {
             String::new()
         };
 
+        // Address range is formatted as "start-end" in lowercase hex without "0x" prefix.
         let (start, end) = match addr_range.split_once('-') {
             Some((s, e)) => {
                 let start = u64::from_str_radix(s, 16).unwrap_or(0);
@@ -177,7 +245,13 @@ fn parse_maps(pid_path: &str) -> Option<Vec<MemRegion>> {
     Some(regions)
 }
 
-/// Check for process masquerading: exe symlink doesn't match cmdline argv[0].
+/// Detect process masquerading by comparing the real executable path
+/// (`/proc/<pid>/exe` symlink target) against `argv[0]` from `/proc/<pid>/cmdline`.
+///
+/// Implants commonly overwrite `argv[0]` to appear as a legitimate system service
+/// (e.g., claiming to be `[kworker/0:1]` or `sshd`) while actually running a
+/// different binary. This function compares basenames and filters out known
+/// legitimate mismatches (busybox multicall, systemd/init, interpreter versioning).
 #[cfg(target_os = "linux")]
 fn check_masquerading(
     result: &mut ScanResult,
@@ -189,26 +263,30 @@ fn check_masquerading(
     use std::fs;
     use std::path::Path;
 
+    // Resolve the /proc/<pid>/exe symlink to get the actual binary path.
     let exe_target = match fs::read_link(format!("{}/exe", pid_path)) {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(_) => return,
     };
 
-    // Strip " (deleted)" suffix
+    // The kernel appends " (deleted)" when the on-disk binary has been removed
+    // but the process is still running. Strip it for comparison purposes.
     let exe_clean = exe_target
         .strip_suffix(" (deleted)")
         .unwrap_or(&exe_target);
 
+    // /proc/<pid>/cmdline is a sequence of null-terminated strings.
     let cmdline = match fs::read(format!("{}/cmdline", pid_path)) {
         Ok(data) => data,
         Err(_) => return,
     };
 
+    // Kernel threads have empty cmdline.
     if cmdline.is_empty() {
         return;
     }
 
-    // argv[0] is the first null-terminated string
+    // Extract argv[0]: the first null-terminated string in the cmdline blob.
     let argv0_end = cmdline.iter().position(|&b| b == 0).unwrap_or(cmdline.len());
     let argv0 = String::from_utf8_lossy(&cmdline[..argv0_end]).trim().to_string();
 
@@ -216,7 +294,8 @@ fn check_masquerading(
         return;
     }
 
-    // Compare the basename of exe vs argv0
+    // Compare only the filename component (basename) -- full paths differ
+    // legitimately due to symlinks (e.g., /usr/bin/python3 vs /usr/bin/python3.11).
     let exe_basename = Path::new(exe_clean)
         .file_name()
         .and_then(|n| n.to_str())
@@ -226,24 +305,23 @@ fn check_masquerading(
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    // If argv0 looks like a path (contains /), compare basenames
-    // If argv0 is just a name, compare against exe basename
     if !exe_basename.is_empty() && !argv0_basename.is_empty() && exe_basename != argv0_basename {
-        // Skip kernel threads and common legitimate renames
+        // Kernel threads and internal process names are enclosed in brackets
+        // or parentheses (e.g., [kworker/0:1], (sd-pam)). These are not masquerading.
         if argv0_basename.starts_with('[') || exe_basename.starts_with('[')
             || argv0_basename.starts_with('(') || exe_basename.starts_with('(')
         {
             return;
         }
-        // Some interpreters legitimately differ (python3 -> python3.11)
+
+        // Interpreter version suffixes cause harmless mismatches
+        // (e.g., exe="python3.11" argv0="python3"). Allow if one is a prefix of the other.
         if exe_basename.starts_with(argv0_basename) || argv0_basename.starts_with(exe_basename) {
             return;
         }
-        // Common legitimate masquerading patterns
-        // systemd/init: PID 1 often runs as /sbin/init -> /usr/lib/systemd/systemd
-        // busybox: multicall binary that appears as sh, ls, etc.
-        // udevadm: launched as systemd-udevd
-        // sd-pam: systemd PAM helper
+
+        // Whitelist of known-legitimate exe/argv0 pairs that would otherwise
+        // trigger false positives. Each tuple is (exe_basename, argv0_basename).
         const LEGIT_PAIRS: &[(&str, &str)] = &[
             ("systemd", "init"),
             ("udevadm", "systemd-udevd"),
@@ -270,6 +348,7 @@ fn check_masquerading(
             if exe_basename == *exe_match && argv0_basename == *argv0_match {
                 return;
             }
+            // Also allow partial matches on the exe side (e.g., "busybox-1.36" contains "busybox").
             if exe_basename.contains(exe_match) && argv0_basename == *argv0_match {
                 return;
             }
@@ -293,7 +372,13 @@ fn check_masquerading(
     }
 }
 
-/// Check /proc/<pid>/environ for IMIX-related environment variables.
+/// Inspect a process's environment block (`/proc/<pid>/environ`) for variables
+/// that match known IMIX/C2 configuration patterns.
+///
+/// The environ file is a null-byte-delimited sequence of `KEY=VALUE` pairs.
+/// We check each variable against a list of suspicious prefixes. A single match
+/// is sufficient to generate a Tier2 finding because legitimate software rarely
+/// uses these variable names.
 #[cfg(target_os = "linux")]
 fn check_environ(
     result: &mut ScanResult,
@@ -309,7 +394,9 @@ fn check_environ(
         Err(_) => return,
     };
 
-    // Environment is null-byte separated KEY=VALUE pairs
+    // Prefixes associated with IMIX implant configuration or generic C2 beaconing.
+    // IMIX_ variants cover the Realm framework's implant specifically.
+    // C2_ and BEACON_/CALLBACK_ cover more generic implant patterns.
     let suspicious_prefixes: &[&str] = &[
         "IMIX_",
         "IMIX_CALLBACK",
@@ -326,6 +413,7 @@ fn check_environ(
         "CALLBACK_INTERVAL",
     ];
 
+    // Split on null bytes to iterate individual KEY=VALUE entries.
     for var_bytes in environ.split(|&b| b == 0) {
         if var_bytes.is_empty() {
             continue;
@@ -334,6 +422,7 @@ fn check_environ(
         for prefix in suspicious_prefixes {
             if var.starts_with(prefix) {
                 if verbose {
+                    // Truncate to 80 chars to avoid flooding stderr with long values.
                     eprintln!(
                         "[memory] suspicious env var: pid={} var={}",
                         pid,
@@ -351,17 +440,32 @@ fn check_environ(
                         &var[..var.len().min(120)]
                     ),
                 ));
+                // Break after first prefix match per variable to avoid duplicate
+                // findings when one prefix is a subset of another (e.g., "IMIX_"
+                // and "IMIX_CALLBACK" would both match "IMIX_CALLBACK_URL=...").
                 break;
             }
         }
     }
 }
 
-/// Analyze /proc/<pid>/maps for:
-/// - Anonymous executable regions (rwxp with no file)
-/// - memfd-backed executable regions
-/// - Shared libraries loaded from suspicious paths
-/// Returns parsed regions for later use in memory scanning.
+/// Analyze a process's memory mappings for three classes of suspicious regions:
+///
+/// - **Anonymous RWX regions**: Memory with read+write+execute permissions and no
+///   backing file. Normal programs rarely need RWX memory; it is a strong indicator
+///   of runtime code generation or injection. Small regions (<4KB) are ignored as
+///   they are commonly used for legitimate trampolines and signal handlers.
+///
+/// - **memfd-backed executable regions**: Code loaded from `memfd_create(2)` objects,
+///   which exist only in memory. This is the primary mechanism for fileless execution
+///   on Linux.
+///
+/// - **Shared libraries from suspicious paths**: `.so` files loaded from `/tmp`,
+///   `/dev/shm`, `/var/tmp`, or hidden directories (paths containing `/.`). Legitimate
+///   libraries are installed under `/usr/lib` or `/lib`; world-writable locations
+///   suggest an attacker dropped a malicious library.
+///
+/// Returns the parsed regions for reuse by `scan_process_memory`.
 #[cfg(target_os = "linux")]
 fn check_maps(
     result: &mut ScanResult,
@@ -372,6 +476,7 @@ fn check_maps(
 ) -> Option<Vec<MemRegion>> {
     let regions = parse_maps(pid_path)?;
 
+    // Directories where legitimate shared libraries should never reside.
     let suspicious_lib_dirs: &[&str] = &[
         "/tmp/",
         "/dev/shm/",
@@ -379,20 +484,24 @@ fn check_maps(
         "/run/shm/",
     ];
 
+    // Track whether we've already reported each category to avoid duplicate
+    // findings for the same process (one finding per category is sufficient).
     let mut found_anon_rwx = false;
     let mut found_memfd = false;
 
     for region in &regions {
-        // Anonymous executable regions (no backing file, executable)
+        // --- Anonymous executable regions ---
         if region.is_anonymous() && region.is_executable() {
             let size = region.end - region.start;
-            // Skip tiny regions (<4KB) -- likely trampolines or signal handlers
+            // Regions smaller than one page are likely JIT trampolines, signal
+            // return frames, or glibc-internal stubs. Not worth flagging.
             if size < 4096 {
                 continue;
             }
 
             if region.is_writable() && !found_anon_rwx {
-                // RWX anonymous -- very suspicious
+                // RWX + anonymous = very suspicious. Legitimate programs almost
+                // never need writable+executable anonymous memory.
                 found_anon_rwx = true;
                 if verbose {
                     eprintln!(
@@ -410,10 +519,12 @@ fn check_maps(
                     ),
                 ));
             }
-            // We don't flag r-xp anonymous as aggressively -- JIT and some runtimes use these
+            // Read+execute anonymous (r-xp) regions are less suspicious -- JIT
+            // compilers (V8, .NET, JVM) and some language runtimes use these
+            // legitimately, so we do not flag them.
         }
 
-        // memfd-backed executable regions
+        // --- memfd-backed executable regions ---
         if region.is_memfd() && region.is_executable() && !found_memfd {
             found_memfd = true;
             if verbose {
@@ -433,10 +544,10 @@ fn check_maps(
             ));
         }
 
-        // Shared libraries from suspicious paths
+        // --- Shared libraries from suspicious paths ---
         if region.is_file_backed() && region.is_executable() {
             let path_lower = region.pathname.to_lowercase();
-            // Check for .so files loaded from suspicious directories
+            // Only flag paths that look like shared objects (.so files).
             if path_lower.contains(".so") || path_lower.ends_with(".so") {
                 for suspect_dir in suspicious_lib_dirs {
                     if region.pathname.starts_with(suspect_dir) {
@@ -460,7 +571,8 @@ fn check_maps(
                 }
             }
 
-            // Check for hidden directory paths (contain /.)
+            // Libraries loaded from hidden directories (containing "/." in the path)
+            // are suspicious. Exclude "/.cache" which is a standard XDG directory.
             if region.pathname.contains("/.") && !region.pathname.contains("/.cache") {
                 result.add_finding(Finding::new(
                     "memory",
@@ -478,7 +590,12 @@ fn check_maps(
     Some(regions)
 }
 
-/// Check /proc/<pid>/fd/ for memfd file descriptors.
+/// Enumerate all file descriptors in `/proc/<pid>/fd/` and check if any point
+/// to memfd objects.
+///
+/// A process holding an open memfd handle may be staging a payload entirely in
+/// memory (e.g., via `memfd_create` + `write` + `fexecve`). Only the first
+/// memfd fd per process is reported to avoid noisy output.
 #[cfg(target_os = "linux")]
 fn check_memfd_fds(
     result: &mut ScanResult,
@@ -496,6 +613,8 @@ fn check_memfd_fds(
     };
 
     for entry in entries.flatten() {
+        // Each entry in /proc/<pid>/fd/ is a symlink to the actual file/device.
+        // For memfd objects, the target looks like "/memfd:<name>" or "memfd:<name>".
         let target = match fs::read_link(entry.path()) {
             Ok(t) => t.to_string_lossy().to_string(),
             Err(_) => continue,
@@ -522,15 +641,34 @@ fn check_memfd_fds(
                     target
                 ),
             ));
-            // Only report once per process
+            // Only report the first memfd fd per process -- additional handles
+            // add no new information and would clutter the output.
             return;
         }
     }
 }
 
-/// Scan process memory by reading /proc/<pid>/mem using the maps as a guide.
-/// Only scans readable, non-file-backed regions (heap, stack, anonymous)
-/// plus the main executable region. Uses the Aho-Corasick scanner.
+/// Read and scan a process's virtual memory for Realm/IMIX byte-level signatures.
+///
+/// Uses `pread(2)` on `/proc/<pid>/mem` to read each eligible region identified
+/// from the previously parsed maps. The `BinaryScanner` (Aho-Corasick automaton)
+/// is run against each memory chunk to detect known C2 strings and byte patterns.
+///
+/// **Region selection heuristics:**
+/// - Only readable regions are scanned (non-readable regions would fault on pread).
+/// - Kernel pseudo-regions (vDSO, vsyscall, vvar) are skipped as they contain
+///   only kernel-provided code.
+/// - System library regions (`/usr/lib`, `/lib`, etc.) are skipped to reduce
+///   scan time and false positives.
+/// - A 32 MB cap per region and 100 MB cap per process prevent runaway memory
+///   consumption when scanning large processes.
+///
+/// **False-positive suppression:**
+/// A process must have 3 or more unique signature matches to be reported. This
+/// threshold filters out incidental matches (e.g., the string "ssh_exec" appearing
+/// in sshd's memory, or generic function names matching a single pattern). Multiple
+/// distinct Realm-specific strings in one process is a strong indicator of an
+/// actual implant.
 #[cfg(target_os = "linux")]
 fn scan_process_memory(
     result: &mut ScanResult,
@@ -552,11 +690,14 @@ fn scan_process_memory(
         Err(_) => return,
     };
 
+    // Track which pattern descriptions have already been seen for this process
+    // to deduplicate matches across different memory regions.
     let mut found_patterns: HashSet<String> = HashSet::new();
+    // Buffer findings until we know whether the threshold is met.
     let mut pending_findings: Vec<Finding> = Vec::new();
     let mut total_scanned: u64 = 0;
     const MAX_SCAN_BYTES: u64 = 100 * 1024 * 1024; // 100 MB cap per process
-    const MAX_REGION_SIZE: u64 = 32 * 1024 * 1024; // 32 MB cap per region
+    const MAX_REGION_SIZE: u64 = 32 * 1024 * 1024;  // 32 MB cap per region
 
     for region in regions {
         if !region.is_readable() {
@@ -564,15 +705,18 @@ fn scan_process_memory(
         }
 
         let size = region.end - region.start;
+        // Skip zero-size regions and regions exceeding the per-region cap.
         if size == 0 || size > MAX_REGION_SIZE {
             continue;
         }
 
+        // Enforce per-process byte budget to bound total scan time.
         if total_scanned + size > MAX_SCAN_BYTES {
             break;
         }
 
-        // Skip vDSO, vsyscall, vvar
+        // vDSO, vsyscall, and vvar are kernel-mapped pages providing fast
+        // syscall stubs. They never contain user-controlled data.
         if region.pathname.starts_with("[vdso]")
             || region.pathname.starts_with("[vsyscall]")
             || region.pathname.starts_with("[vvar]")
@@ -580,7 +724,9 @@ fn scan_process_memory(
             continue;
         }
 
-        // For file-backed regions, only scan if they're from suspicious paths or the main exe
+        // For file-backed regions, skip standard system library paths to avoid
+        // scanning hundreds of MB of libc, libssl, etc. per process. Only
+        // non-system file-backed regions (user binaries, /tmp libs) are scanned.
         if region.is_file_backed() {
             let dominated_by_system = region.pathname.starts_with("/usr/lib")
                 || region.pathname.starts_with("/lib")
@@ -591,7 +737,9 @@ fn scan_process_memory(
             }
         }
 
-        // Read the region via pread
+        // Use pread(2) to read from the process's virtual address space at the
+        // region's start offset. This avoids needing ptrace attach -- reading
+        // /proc/<pid>/mem is allowed if we have CAP_SYS_PTRACE or are the same UID.
         let mut buf = vec![0u8; size as usize];
         let bytes_read = unsafe {
             libc::pread(
@@ -602,6 +750,7 @@ fn scan_process_memory(
             )
         };
 
+        // pread returns -1 on error (e.g., region became unmapped) or 0 at EOF.
         if bytes_read <= 0 {
             continue;
         }
@@ -609,11 +758,13 @@ fn scan_process_memory(
         let buf = &buf[..bytes_read as usize];
         total_scanned += bytes_read as u64;
 
-        // Run Aho-Corasick on the memory chunk
+        // Run the Aho-Corasick multi-pattern matcher against the memory chunk.
+        // The scanner contains all known Realm/IMIX signature patterns.
         let findings = scanner.scan_bytes(buf, &format!("pid:{}", pid));
 
         for f in findings {
-            // Deduplicate across regions within this process
+            // HashSet::insert returns true only for new entries, providing
+            // automatic deduplication across regions within this process.
             if found_patterns.insert(f.description.clone()) {
                 if verbose {
                     eprintln!(
@@ -621,7 +772,6 @@ fn scan_process_memory(
                         pid, proc_name, f.description
                     );
                 }
-                // Collect finding (will only be reported if threshold met)
                 pending_findings.push(Finding::new(
                     "memory",
                     format!("In-memory: {}", f.description),
@@ -652,9 +802,10 @@ fn scan_process_memory(
         );
     }
 
-    // Only report findings if a process has 3+ unique matches.
-    // A single match (e.g., "ssh_exec" in sshd) is likely noise.
-    // Multiple distinct Realm signatures in one process is a strong signal.
+    // Threshold gate: require 3+ unique pattern matches before reporting.
+    // A single match (e.g., "ssh_exec" in sshd) is likely coincidental.
+    // Multiple distinct Realm-specific signatures in one process strongly
+    // suggests an actual implant is resident in memory.
     if pending_findings.len() >= 3 {
         for f in pending_findings {
             result.add_finding(f);
@@ -671,6 +822,11 @@ fn scan_process_memory(
 // Windows implementation
 // ---------------------------------------------------------------------------
 
+/// Windows process enumeration and memory scanning entry point.
+///
+/// Uses a platform-specific `enumerate_processes` helper to list running
+/// processes, then scans each one for private executable memory and
+/// Realm/IMIX signatures. Skips PID 0 (System Idle) and PID 4 (System).
 #[cfg(windows)]
 fn scan_windows(result: &mut ScanResult, self_pid: u32, verbose: bool) {
     use crate::platform::windows::enumerate_processes;
@@ -680,11 +836,12 @@ fn scan_windows(result: &mut ScanResult, self_pid: u32, verbose: bool) {
     let procs = enumerate_processes();
 
     for proc_info in &procs {
+        // Skip self, System Idle (PID 0), and System (PID 4).
         if proc_info.pid == self_pid || proc_info.pid == 0 || proc_info.pid == 4 {
             continue;
         }
 
-        // 1. Private executable memory detection + memory scanning
+        // Combined check: private executable memory detection + signature scanning.
         scan_windows_process_memory(
             result,
             &scanner,
@@ -695,10 +852,22 @@ fn scan_windows(result: &mut ScanResult, self_pid: u32, verbose: bool) {
     }
 }
 
-/// Scan a Windows process for:
-/// - Private executable memory regions (MEM_PRIVATE + PAGE_EXECUTE*)
-/// - Realm C2 signatures in process memory
-/// - Thread start addresses in private memory
+/// Scan a single Windows process for injected code and Realm/IMIX signatures.
+///
+/// Walks the process's virtual address space using `VirtualQueryEx` to enumerate
+/// memory regions. For each region:
+///
+/// - **Private executable memory** (`MEM_PRIVATE` + `PAGE_EXECUTE*`): Flags regions
+///   larger than 8KB. Small private exec regions are common in .NET, JIT compilers,
+///   and Windows runtime trampolines. RWX private regions are elevated to Tier2
+///   (higher severity) since they are rarely legitimate.
+///
+/// - **Signature scanning**: Reads non-system executable regions via
+///   `ReadProcessMemory` and runs the Aho-Corasick scanner. `MEM_IMAGE` regions
+///   (backed by loaded DLLs/EXEs) are skipped to reduce noise.
+///
+/// The same 3-match threshold as Linux is applied before findings are reported.
+/// If the threshold is met, thread start address analysis is also performed.
 #[cfg(windows)]
 fn scan_windows_process_memory(
     result: &mut ScanResult,
@@ -719,6 +888,9 @@ fn scan_windows_process_memory(
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 
     unsafe {
+        // Open the target process with query + read permissions.
+        // This will fail for protected processes (csrss, lsass) unless running
+        // with SeDebugPrivilege.
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
         if handle.is_null() {
             return;
@@ -733,6 +905,7 @@ fn scan_windows_process_memory(
         const MAX_REGION_SIZE: usize = 32 * 1024 * 1024;
 
         loop {
+            // Query the next memory region starting at `address`.
             let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             let ret = VirtualQueryEx(
                 handle,
@@ -741,18 +914,23 @@ fn scan_windows_process_memory(
                 std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             );
 
+            // VirtualQueryEx returns 0 when we've walked past the end of the
+            // address space.
             if ret == 0 {
                 break;
             }
 
+            // Check if the region's page protection includes execute permission.
             let is_exec = matches!(
                 mbi.Protect,
                 PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
             );
 
-            // Check for private executable regions
-            // Skip small regions (<=8KB) as many legitimate Windows processes
-            // use small private exec regions for JIT, .NET, trampolines, etc.
+            // --- Private executable region detection ---
+            // MEM_PRIVATE means the region is not backed by a file (DLL/EXE image)
+            // or shared section. Executable private memory indicates dynamically
+            // generated code, which is suspicious in most native processes.
+            // Threshold: >8KB to skip JIT trampolines and .NET runtime stubs.
             if mbi.Type == MEM_PRIVATE && is_exec && mbi.RegionSize > 8192 && !found_private_exec {
                 found_private_exec = true;
                 if verbose {
@@ -762,8 +940,10 @@ fn scan_windows_process_memory(
                     );
                 }
 
+                // RWX (read-write-execute) is the most suspicious combination --
+                // it allows writing new code and immediately executing it.
                 let tier = if mbi.Protect == PAGE_EXECUTE_READWRITE {
-                    Tier::Tier2 // RWX is very suspicious
+                    Tier::Tier2
                 } else {
                     Tier::Behavioral
                 };
@@ -783,9 +963,11 @@ fn scan_windows_process_memory(
                 ));
             }
 
-            // Scan readable non-system regions for signatures
+            // --- Signature scanning of non-system executable regions ---
             if is_exec && mbi.RegionSize >= 4096 && mbi.RegionSize <= MAX_REGION_SIZE {
-                // Skip MEM_IMAGE regions backed by system DLLs (too noisy)
+                // Skip MEM_IMAGE regions (mapped from on-disk DLLs/EXEs). These
+                // are the vast majority of executable memory in a Windows process
+                // and scanning them would be too slow and noisy.
                 let should_scan = mbi.Type == MEM_PRIVATE || mbi.Type != MEM_IMAGE;
 
                 if should_scan && total_scanned + mbi.RegionSize as u64 <= MAX_SCAN_BYTES {
@@ -831,19 +1013,23 @@ fn scan_windows_process_memory(
                 }
             }
 
-            // Advance to next region
+            // Advance to the next region by adding the current region's size
+            // to its base address.
             address = mbi.BaseAddress as usize + mbi.RegionSize;
+            // Guard against wraparound at the top of the address space.
             if address == 0 {
-                break; // overflow protection
+                break;
             }
         }
 
-        // Only report findings if 3+ unique matches (same threshold as Linux)
+        // Apply the same 3-match threshold as the Linux scanner.
         if pending_findings.len() >= 3 {
             for f in pending_findings {
                 result.add_finding(f);
             }
-            // Thread analysis only worth doing for suspect processes
+            // Thread analysis is only performed for processes that already met
+            // the signature threshold, since it requires additional API calls
+            // and is only useful as supplementary evidence.
             check_thread_start_addresses(result, handle, pid, proc_name, verbose);
         } else if verbose && !pending_findings.is_empty() {
             eprintln!(
@@ -856,7 +1042,21 @@ fn scan_windows_process_memory(
     }
 }
 
-/// Check if any thread in the process has a start address in private (non-image) memory.
+/// Enumerate threads belonging to `pid` and check whether any thread's Win32
+/// start address falls within non-image (private) memory.
+///
+/// A thread whose start address is in `MEM_PRIVATE` memory (rather than
+/// `MEM_IMAGE`, which is backed by a loaded DLL/EXE) strongly suggests
+/// reflective DLL injection, shellcode injection, or similar code injection
+/// techniques. This check uses `NtQueryInformationThread` with the
+/// `ThreadQuerySetWin32StartAddress` (info class 9) to retrieve the start
+/// address, then `VirtualQueryEx` to determine the memory type.
+///
+/// Only the first suspicious thread per process is reported.
+///
+/// # Safety
+/// Requires a valid process handle with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`.
+/// All Win32 handles are closed before returning.
 #[cfg(windows)]
 unsafe fn check_thread_start_addresses(
     result: &mut ScanResult,
@@ -874,6 +1074,8 @@ unsafe fn check_thread_start_addresses(
         OpenThread, THREAD_QUERY_INFORMATION,
     };
 
+    // Take a snapshot of all threads in the system (TH32CS_SNAPTHREAD captures
+    // threads across all processes; we filter by PID below).
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         return;
@@ -886,11 +1088,13 @@ unsafe fn check_thread_start_addresses(
 
     if Thread32First(snap, &mut te) != 0 {
         loop {
+            // Only inspect threads belonging to our target process.
             if te.th32OwnerProcessID == pid && !found_suspicious_thread {
                 let thread_handle = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
                 if !thread_handle.is_null() {
-                    // NtQueryInformationThread to get start address
-                    // ThreadQuerySetWin32StartAddress = 9
+                    // Use NtQueryInformationThread to retrieve the thread's
+                    // Win32 start address. This is an undocumented (but stable)
+                    // NTDLL function. Info class 9 = ThreadQuerySetWin32StartAddress.
                     let mut start_addr: usize = 0;
                     let mut return_len: u32 = 0;
 
@@ -898,6 +1102,8 @@ unsafe fn check_thread_start_addresses(
                         *mut std::ffi::c_void, u32, *mut std::ffi::c_void, u32, *mut u32,
                     ) -> i32;
 
+                    // Dynamically resolve NtQueryInformationThread from ntdll.dll
+                    // to avoid a static link dependency on ntdll.
                     let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
                         b"ntdll.dll\0".as_ptr(),
                     );
@@ -917,7 +1123,10 @@ unsafe fn check_thread_start_addresses(
                             );
 
                             if status == 0 && start_addr != 0 {
-                                // Check if start address is in MEM_IMAGE or MEM_PRIVATE
+                                // Determine what type of memory the start address
+                                // resides in. MEM_IMAGE means it's backed by a
+                                // loaded module (normal). Anything else (MEM_PRIVATE,
+                                // MEM_MAPPED) is suspicious.
                                 let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
                                 let ret = VirtualQueryEx(
                                     process_handle,
