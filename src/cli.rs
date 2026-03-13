@@ -25,6 +25,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Generate an incident response report with forensic details.
+        #[arg(long)]
+        ir: bool,
+
         /// Path to allowlist file.
         #[arg(long)]
         allowlist: Option<String>,
@@ -58,8 +62,8 @@ impl Cli {
     /// Dispatch to the appropriate subcommand handler.
     pub fn run(&self) -> anyhow::Result<i32> {
         match &self.command {
-            Command::Scan { layer, json, allowlist } => {
-                run_scan(layer.as_ref(), *json, allowlist.as_deref(), self.verbose)
+            Command::Scan { layer, json, ir, allowlist } => {
+                run_scan(layer.as_ref(), *json, *ir, allowlist.as_deref(), self.verbose)
             }
             Command::Watch { layer, interval, baseline, json, allowlist } => {
                 let baseline_secs = baseline.as_deref().and_then(|b| b.parse::<u64>().ok());
@@ -79,6 +83,7 @@ impl Cli {
 fn run_scan(
     layer: Option<&Layer>,
     json: bool,
+    ir: bool,
     allowlist_path: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<i32> {
@@ -113,9 +118,22 @@ fn run_scan(
     }
 
     if json {
-        output::json::print_result(&result);
+        if ir {
+            let report = dispel::ir::generate_report(&result);
+            let combined = serde_json::json!({
+                "scan": result,
+                "ir_report": report,
+            });
+            println!("{}", serde_json::to_string_pretty(&combined).unwrap_or_default());
+        } else {
+            output::json::print_result(&result);
+        }
     } else {
         output::human::print_result(&result);
+        if ir {
+            let report = dispel::ir::generate_report(&result);
+            output::human::print_ir_report(&report);
+        }
     }
 
     Ok(result.exit_code())

@@ -4,6 +4,7 @@ pub mod scan;
 pub mod platform;
 pub mod allowlist;
 pub mod watch;
+pub mod ir;
 
 use serde::{Deserialize, Serialize};
 
