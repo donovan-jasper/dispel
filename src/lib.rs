@@ -93,6 +93,7 @@ pub enum Layer {
     Net,
     Persist,
     Behavior,
+    Memory,
 }
 
 /// A single detection finding.

@@ -105,6 +105,9 @@ fn run_scan_layers(layer: Option<&Layer>, verbose: bool) -> ScanResult {
     if run_all || matches!(layer, Some(Layer::Behavior)) {
         result.merge(scan::behavior::scan(verbose));
     }
+    if run_all || matches!(layer, Some(Layer::Memory)) {
+        result.merge(scan::memory::scan(verbose));
+    }
 
     result
 }

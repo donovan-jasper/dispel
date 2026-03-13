@@ -60,7 +60,7 @@ pub fn enumerate_processes() -> Vec<ProcessInfo> {
 fn get_process_image_path(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle == 0 {
+        if handle.is_null() {
             return None;
         }
 
@@ -166,7 +166,7 @@ pub fn check_registry_imix() -> Vec<crate::Finding> {
 
     unsafe {
         let subkey: Vec<u16> = "SOFTWARE\\Imix\0".encode_utf16().collect();
-        let mut hkey = 0isize;
+        let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
 
         let status = RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
