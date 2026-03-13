@@ -17,11 +17,25 @@ pub struct IrReport {
     pub implants: Vec<ImplantReport>,
 }
 
+/// Configuration extracted from the implant binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedConfig {
+    /// Callback URIs found in the binary (compiled-in C2 addresses).
+    pub callback_uris: Vec<String>,
+    /// Beacon ID variable name or value if found.
+    pub beacon_id: Option<String>,
+    /// Callback interval if found.
+    pub callback_interval: Option<String>,
+    /// Any other interesting config strings.
+    pub other: Vec<String>,
+}
+
 /// Forensic report for a single detected implant binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplantReport {
     pub path: String,
     pub file_info: Option<FileInfo>,
+    pub extracted_config: Option<ExtractedConfig>,
     pub processes: Vec<ProcessDetail>,
     pub connections: Vec<ConnectionDetail>,
     pub persistence: Vec<PersistenceDetail>,
@@ -129,6 +143,7 @@ pub fn generate_report(result: &ScanResult) -> IrReport {
 
     for path in &paths {
         let file_info = collect_file_info(path);
+        let extracted_config = extract_config(path);
         let processes = collect_process_details(path);
         let connections = collect_process_connections(&processes);
         let persistence = extract_persistence(result, path);
@@ -136,6 +151,7 @@ pub fn generate_report(result: &ScanResult) -> IrReport {
         implants.push(ImplantReport {
             path: path.clone(),
             file_info,
+            extracted_config,
             processes,
             connections,
             persistence,
@@ -143,6 +159,101 @@ pub fn generate_report(result: &ScanResult) -> IrReport {
     }
 
     IrReport { implants }
+}
+
+/// Extract compiled-in configuration from the implant binary.
+///
+/// Realm's imix agent compiles callback URIs, beacon IDs, and intervals
+/// into the binary via env!() macros at build time. These appear as
+/// string literals that survive even when the process isn't connected.
+fn extract_config(path: &str) -> Option<ExtractedConfig> {
+    use std::fs;
+
+    let data = fs::read(path).ok()?;
+
+    // Extract printable ASCII strings of length >= 6
+    let strings = extract_strings(&data, 6);
+
+    let mut callback_uris = Vec::new();
+    let mut beacon_id: Option<String> = None;
+    let mut callback_interval: Option<String> = None;
+    let mut other = Vec::new();
+
+    // Rust compiles string literals into contiguous read-only data without null
+    // separators, so the callback URI ends up inside a huge blob of concatenated
+    // strings. We need to regex-search inside each extracted string for URLs.
+    // Match URLs: scheme + authority (host:port) + optional path
+    // Stop at lowercase letters immediately after port (no path separator) to avoid
+    // bleeding into adjacent concatenated strings like "http://10.0.0.1:8080jitter..."
+    let url_re = regex::Regex::new(r"https?://[A-Za-z0-9.-]+(?::\d+)?(?:/[A-Za-z0-9._:/%?&=-]*)?").unwrap();
+    let pubkey_re = regex::Regex::new(r"[A-Za-z0-9+/]{42}[A-Za-z0-9+/=]=").unwrap();
+
+    let ignored_domains = [
+        "mozilla.org", "rust-lang.org", "github.com", "crates.io",
+        "w3.org", "schema.org", "example.com", "hyper.rs", "docs.rs",
+        "httpbin.org", "localhost", "127.0.0.1", "apple.com",
+        "cloudflare", "google", "doh", "tonic", "www.",
+    ];
+
+    for s in &strings {
+        // Find all URLs embedded within the string
+        for url_match in url_re.find_iter(s) {
+            let url = url_match.as_str();
+            if !ignored_domains.iter().any(|d| url.contains(d)) {
+                callback_uris.push(url.to_string());
+            }
+        }
+
+        // Find base64 public keys (44 chars, ends with =)
+        // Only check reasonably-sized strings to avoid scanning megabytes
+        if s.len() < 100 {
+            for key_match in pubkey_re.find_iter(s) {
+                let key = key_match.as_str();
+                if key.len() == 44 {
+                    other.push(format!("server_pubkey: {}", key));
+                }
+            }
+        }
+    }
+
+    // Deduplicate
+    callback_uris.sort();
+    callback_uris.dedup();
+    other.sort();
+    other.dedup();
+
+    // beacon_id and callback_interval are found via the persistence layer
+    // and process env vars respectively — don't try to parse them from
+    // giant concatenated string blobs in the binary.
+
+    Some(ExtractedConfig {
+        callback_uris,
+        beacon_id: None,
+        callback_interval: None,
+        other,
+    })
+}
+
+/// Extract printable ASCII strings of at least `min_len` from binary data.
+fn extract_strings(data: &[u8], min_len: usize) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut current = String::new();
+
+    for &b in data {
+        if b >= 0x20 && b < 0x7f {
+            current.push(b as char);
+        } else {
+            if current.len() >= min_len {
+                strings.push(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= min_len {
+        strings.push(current);
+    }
+
+    strings
 }
 
 /// Collect file metadata including SHA256 hash.

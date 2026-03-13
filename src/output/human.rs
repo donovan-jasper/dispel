@@ -94,6 +94,29 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
             println!("    Created:     {}", fi.created);
         }
 
+        // Extracted config
+        if let Some(ref config) = implant.extracted_config {
+            if !config.callback_uris.is_empty() || config.beacon_id.is_some() {
+                println!();
+                println!("  {}", "Extracted Config (compiled into binary):".cyan().bold());
+                if !config.callback_uris.is_empty() {
+                    println!("    C2 Callback:");
+                    for uri in &config.callback_uris {
+                        println!("      {}", uri.red().bold());
+                    }
+                }
+                if let Some(ref interval) = config.callback_interval {
+                    println!("    Interval:    {}", interval);
+                }
+                if let Some(ref bid) = config.beacon_id {
+                    println!("    Beacon ID:   {}", bid);
+                }
+                for item in &config.other {
+                    println!("    {}", item.yellow());
+                }
+            }
+        }
+
         // Processes
         if !implant.processes.is_empty() {
             println!();
