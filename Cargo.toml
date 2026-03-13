@@ -3,6 +3,7 @@ name = "dispel"
 version = "0.1.0"
 edition = "2021"
 description = "Break the enchantment — detect and remove Realm C2 implants"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
