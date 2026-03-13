@@ -76,16 +76,34 @@ impl Cli {
 }
 
 fn run_scan(
-    _layer: Option<&Layer>,
+    layer: Option<&Layer>,
     json: bool,
     _allowlist: Option<&str>,
-    _verbose: bool,
+    verbose: bool,
 ) -> anyhow::Result<i32> {
-    use realm_detect::ScanResult;
     use realm_detect::output;
+    use realm_detect::scan;
+    use realm_detect::{Layer, ScanResult};
 
-    // Layers are stubs — results will be populated when scanning modules are implemented.
-    let result = ScanResult::new();
+    let mut result = ScanResult::new();
+
+    let run_all = layer.is_none();
+
+    if run_all || matches!(layer, Some(Layer::Proc)) {
+        result.merge(scan::proc::scan(verbose));
+    }
+
+    if run_all || matches!(layer, Some(Layer::Net)) {
+        // TODO: scan::net::scan(verbose)
+    }
+
+    if run_all || matches!(layer, Some(Layer::Persist)) {
+        // TODO: scan::persist::scan(verbose)
+    }
+
+    if run_all || matches!(layer, Some(Layer::Behavior)) {
+        // TODO: scan::behavior::scan(verbose)
+    }
 
     if json {
         output::json::print_result(&result);
