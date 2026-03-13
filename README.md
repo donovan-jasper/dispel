@@ -10,7 +10,9 @@
 
 ## What is this?
 
-**dispel** is a host-based detection tool that finds [Realm](https://github.com/spellshift/realm) command-and-control implants on compromised systems. It scans running processes, network connections, persistence mechanisms, and runtime behavior to identify the Realm C2 agent (imix) with high confidence and zero false positives.
+**dispel** is a host-based detection tool that finds [Realm](https://github.com/spellshift/realm) command-and-control implants on compromised systems. It scans running processes, live process memory, network connections, persistence mechanisms, and runtime behavior to identify the Realm C2 agent (imix) with high confidence and zero false positives.
+
+Detects implants even when the binary has been deleted from disk, renamed to look like a system service, or loaded entirely from memory.
 
 Single static binary. No dependencies. Drop it on a box and run it.
 
@@ -27,11 +29,18 @@ cargo build --release
 # Scan everything
 ./dispel scan
 
+# Scan only in-memory indicators
+./dispel scan --layer memory
+
 # JSON output for automation
 ./dispel scan --json
 
-# Scan only processes
-./dispel scan --layer proc
+# Incident response report with forensic details
+./dispel scan --ir
+
+# Detect, quarantine, and kill implants (dry run first)
+./dispel kill --dry-run
+./dispel kill
 
 # Continuous monitoring (10s interval)
 ./dispel watch --interval 10
@@ -42,6 +51,7 @@ cargo build --release
 | Layer | What it detects |
 |-------|----------------|
 | **proc** | Scans live process binaries for Realm signatures using Aho-Corasick multi-pattern matching. Checks known install paths (`/tmp/imix`, `/bin/imix`, etc.). Flags deleted executables and high thread counts. |
+| **memory** | Reads live process memory via `/proc/pid/mem` (Linux) or `ReadProcessMemory` (Windows) to find Realm signatures in running processes — even after the binary is deleted from disk. Detects anonymous RWX memory regions, `memfd`-based fileless execution, process masquerading (exe vs argv[0] mismatch), shared libraries loaded from `/tmp` or `/dev/shm`, suspicious environment variables (`IMIX_*`), private executable regions, and injected threads with start addresses in non-image memory. |
 | **net** | Identifies Realm gRPC service paths (`/c2.C2/ClaimTasks`, `/c2.C2/ReverseShell`, etc.) in traffic. Detects DNS tunneling via base32-encoded subdomains. Flags high-entropy prefixes (X25519 pubkey + XChaCha20 nonce). Monitors for beaconing patterns. |
 | **persist** | Finds beacon ID files (UUID v4 at known paths). Checks systemd units, sysvinit scripts, and Windows registry/services for Realm service names. Detects timestomped binaries. |
 | **behavior** | Identifies shell processes with socket-redirected file descriptors (reverse shells). Flags recent `/etc/shadow` access (credential harvesting). |
@@ -80,12 +90,51 @@ All signatures are scanned simultaneously using an [Aho-Corasick](https://en.wik
 
 ## Platform Support
 
-| Platform | Process Scanning | Network | Persistence | Behavior |
-|----------|-----------------|---------|-------------|----------|
-| Linux | Full | Full | Full | Full |
-| Windows | Full | Full | Full | Stub |
-| BSD | Stub | Stub | Partial | Stub |
-| macOS | Build only | Build only | Build only | Build only |
+| Platform | Process Scanning | Memory | Network | Persistence | Behavior | Kill |
+|----------|-----------------|--------|---------|-------------|----------|------|
+| Linux | Full | Full | Full | Full | Full | Full |
+| Windows | Full | Full | Full | Full | Stub | — |
+| BSD | Stub | — | Stub | Partial | Stub | — |
+| macOS | Build only | — | Build only | Build only | Build only | — |
+
+## Incident Response
+
+Generate a forensic report with `--ir`:
+
+```bash
+./dispel scan --ir
+```
+
+For each detected implant, the IR report includes:
+- SHA256 hash, file size, owner, permissions, timestamps
+- Extracted C2 callback URIs compiled into the binary
+- Running process details (PID, parent, user, cmdline, cwd, start time, environment)
+- Active network connections attributed to the implant
+- Persistence mechanisms (beacon IDs, services, systemd units)
+- One-liner summary for Slack/triage
+
+JSON output combines scan results and IR data:
+
+```bash
+./dispel scan --ir --json
+```
+
+## Kill Command
+
+Detect, quarantine, and remove implants in one step (Linux only):
+
+```bash
+# Preview what would happen
+./dispel kill --dry-run
+
+# Execute: quarantine binary, kill processes, remove persistence
+./dispel kill
+
+# Custom quarantine directory
+./dispel kill --quarantine-dir /evidence/quarantine
+```
+
+Default quarantine location: `/var/lib/dispel/quarantine/`. Quarantined binaries are named `<sha256prefix>_<basename>` for deduplication.
 
 ## Cross-Compilation
 
