@@ -156,6 +156,13 @@ impl ScanResult {
         }
     }
 
+    /// Filter out findings that match the allowlist and recalculate score/severity.
+    pub fn filter(&mut self, allowlist: &allowlist::Allowlist) {
+        self.findings.retain(|f| !allowlist.should_allow(f));
+        self.score = self.findings.iter().map(|f| f.tier.weight()).sum();
+        self.severity = Severity::from_score(self.score);
+    }
+
     /// Exit code: 0 = clean, 1 = suspect, 2 = detected, 3 = error.
     pub fn exit_code(&self) -> i32 {
         match self.severity {

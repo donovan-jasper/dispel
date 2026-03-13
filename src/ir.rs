@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::{Finding, ScanResult};
+use crate::ScanResult;
 
 /// Full IR report for all detected implants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,8 +204,8 @@ fn extract_config(path: &str) -> Option<ExtractedConfig> {
     let strings = extract_strings(&data, 6);
 
     let mut callback_uris = Vec::new();
-    let mut beacon_id: Option<String> = None;
-    let mut callback_interval: Option<String> = None;
+    let _beacon_id: Option<String> = None;
+    let _callback_interval: Option<String> = None;
     let mut other = Vec::new();
 
     // Rust compiles string literals into contiguous read-only data without null

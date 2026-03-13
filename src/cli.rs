@@ -66,6 +66,14 @@ pub enum Command {
         /// Path to allowlist file.
         #[arg(long)]
         allowlist: Option<String>,
+
+        /// Send findings to local syslog (UDP 127.0.0.1:514) in CEF format.
+        #[arg(long)]
+        syslog: bool,
+
+        /// Send findings as JSON to a webhook URL (HTTP POST).
+        #[arg(long)]
+        webhook: Option<String>,
     },
 }
 
@@ -76,7 +84,7 @@ impl Cli {
             Command::Scan { layer, json, ir, allowlist } => {
                 run_scan(layer.as_ref(), *json, *ir, allowlist.as_deref(), self.verbose)
             }
-            Command::Watch { layer, interval, baseline, json, allowlist } => {
+            Command::Watch { layer, interval, baseline, json, allowlist, syslog, webhook } => {
                 let baseline_secs = baseline.as_deref().and_then(|b| b.parse::<u64>().ok());
                 run_watch(
                     layer.as_ref(),
@@ -84,6 +92,8 @@ impl Cli {
                     baseline_secs,
                     *json,
                     allowlist.as_deref(),
+                    *syslog,
+                    webhook.as_deref(),
                     self.verbose,
                 )
             }
@@ -106,7 +116,7 @@ fn run_scan(
     use dispel::scan;
     use dispel::{Layer, ScanResult};
 
-    let _allowlist = match allowlist_path {
+    let allowlist = match allowlist_path {
         Some(path) => Allowlist::from_file(path)?,
         None => Allowlist::new(),
     };
@@ -133,6 +143,8 @@ fn run_scan(
     if run_all || matches!(layer, Some(Layer::Memory)) {
         result.merge(scan::memory::scan(verbose));
     }
+
+    result.filter(&allowlist);
 
     if json {
         if ir {
@@ -171,6 +183,8 @@ fn run_watch(
     baseline: Option<u64>,
     json: bool,
     allowlist_path: Option<&str>,
+    syslog: bool,
+    webhook: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<i32> {
     use dispel::allowlist::Allowlist;
@@ -181,5 +195,5 @@ fn run_watch(
         None => Allowlist::new(),
     };
 
-    watch::run(layer, interval, baseline, json, &allowlist, verbose)
+    watch::run(layer, interval, baseline, json, &allowlist, syslog, webhook, verbose)
 }

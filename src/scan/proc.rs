@@ -115,6 +115,25 @@ impl Default for BinaryScanner {
 }
 
 // ---------------------------------------------------------------------------
+// Hash checking helper
+// ---------------------------------------------------------------------------
+
+/// Check a binary file against known hashes. Returns a Finding if matched.
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", windows))]
+fn check_known_hash(path: &str) -> Option<Finding> {
+    use crate::signatures::hashes::{check_hash, sha256_file};
+
+    let hash = sha256_file(path)?;
+    let description = check_hash(&hash)?;
+    Some(Finding::new(
+        "proc",
+        format!("Binary matches known imix hash: {}", description),
+        Tier::Tier1,
+        format!("path={} sha256={}", path, hash),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Task 8: top-level proc scan entry point
 // ---------------------------------------------------------------------------
 
@@ -124,6 +143,25 @@ fn self_exe_path() -> Option<String> {
         .ok()
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Case-insensitive path comparison for self-detection (needed on Windows
+/// where path casing and prefix (\\?\, UNC) varies between APIs).
+fn is_self_exe(path: &str, self_exe: &Option<String>) -> bool {
+    match self_exe.as_deref() {
+        Some(s) => {
+            #[cfg(windows)]
+            {
+                // Normalize: strip \\?\ prefix, compare case-insensitive
+                let norm_path = path.strip_prefix(r"\\?\").unwrap_or(path);
+                let norm_self = s.strip_prefix(r"\\?\").unwrap_or(s);
+                norm_path.eq_ignore_ascii_case(norm_self)
+            }
+            #[cfg(not(windows))]
+            { path == s }
+        }
+        None => false,
+    }
 }
 
 /// Scan process layer and return accumulated findings.
@@ -177,7 +215,7 @@ pub fn scan(verbose: bool) -> ScanResult {
             // (which remains readable) and rewrite the finding detail to show
             // the original path instead of the /proc path.
             if let Some(ref exe) = proc.exe_path {
-                let is_self = self_exe.as_deref().map_or(false, |s| exe == s);
+                let is_self = is_self_exe(exe, &self_exe);
                 if !is_self {
                     let scan_path = if proc.deleted_exe {
                         format!("/proc/{}/exe", proc.pid)
@@ -205,6 +243,10 @@ pub fn scan(verbose: bool) -> ScanResult {
                     }
                     for f in findings {
                         result.add_finding(f);
+                    }
+                    // Check against known hashes
+                    if let Some(hash_finding) = check_known_hash(&scan_path) {
+                        result.add_finding(hash_finding);
                     }
                     scanned_paths.insert(exe.clone());
                 }
@@ -254,8 +296,20 @@ pub fn scan(verbose: bool) -> ScanResult {
             eprintln!("[verbose] Found {} Windows processes", procs.len());
         }
 
+        // Windows processes that legitimately have high thread counts
+        const HIGH_THREAD_ALLOWLIST: &[&str] = &[
+            "system", "svchost.exe", "lsass.exe", "csrss.exe",
+            "services.exe", "wmiprvse.exe", "searchindexer.exe",
+            "microsoftedgeupdate.exe", "runtimebroker.exe",
+        ];
+
         for proc_info in &procs {
-            if proc_info.thread_count > 50 {
+            let lower_name = proc_info.name.to_lowercase();
+
+            if proc_info.thread_count > 50
+                && !HIGH_THREAD_ALLOWLIST.contains(&lower_name.as_str())
+                && proc_info.pid != 4
+            {
                 result.add_finding(Finding::new(
                     "proc",
                     format!(
@@ -266,8 +320,6 @@ pub fn scan(verbose: bool) -> ScanResult {
                     proc_info.exe_path.clone().unwrap_or_default(),
                 ));
             }
-
-            let lower_name = proc_info.name.to_lowercase();
             if strings::TIER1_BINARY_NAMES
                 .iter()
                 .any(|n| lower_name == *n)
@@ -284,10 +336,13 @@ pub fn scan(verbose: bool) -> ScanResult {
             }
 
             if let Some(ref path) = proc_info.exe_path {
-                let is_self = self_exe.as_deref().map_or(false, |s| path == s);
+                let is_self = is_self_exe(path, &self_exe);
                 if !is_self {
                     for f in scanner.scan_file(path) {
                         result.add_finding(f);
+                    }
+                    if let Some(hash_finding) = check_known_hash(path) {
+                        result.add_finding(hash_finding);
                     }
                     scanned_paths.insert(path.clone());
                 }
@@ -312,11 +367,95 @@ pub fn scan(verbose: bool) -> ScanResult {
         }
     }
 
-    // --- BSD stub ---
+    // --- BSD live process scanning ---
     #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
     {
-        let _ = verbose;
-        // TODO: enumerate BSD processes via sysctl kinfo_proc
+        use crate::platform::bsd::enumerate_processes;
+        use crate::signatures::strings;
+
+        let procs = enumerate_processes();
+        if verbose {
+            eprintln!("[verbose] Found {} BSD processes", procs.len());
+        }
+
+        for proc_info in &procs {
+            // Check process name against known imix binary names
+            let lower_name = proc_info.name.to_lowercase();
+            if strings::TIER1_BINARY_NAMES
+                .iter()
+                .any(|n| lower_name == *n)
+            {
+                result.add_finding(Finding::new(
+                    "proc",
+                    format!(
+                        "Process named '{}' matches known imix name",
+                        proc_info.name
+                    ),
+                    Tier::Tier1,
+                    format!(
+                        "pid={} exe={}",
+                        proc_info.pid,
+                        proc_info.exe_path.as_deref().unwrap_or("<unknown>")
+                    ),
+                ));
+            }
+
+            // Binary scan of each live process executable (skip self)
+            if let Some(ref exe) = proc_info.exe_path {
+                let is_self = is_self_exe(exe, &self_exe);
+                if !is_self {
+                    let findings = scanner.scan_file(exe);
+                    if verbose && !findings.is_empty() {
+                        eprintln!(
+                            "[proc] {} finding(s) in pid={} exe={}",
+                            findings.len(),
+                            proc_info.pid,
+                            exe,
+                        );
+                    }
+                    for f in findings {
+                        result.add_finding(f);
+                    }
+                    // Check against known hashes
+                    if let Some(hash_finding) = check_known_hash(exe) {
+                        result.add_finding(hash_finding);
+                    }
+                    scanned_paths.insert(exe.clone());
+                }
+            }
+        }
+
+        // Check known BSD install paths
+        let bsd_install_paths: &[&str] = &[
+            "/bin/imix",
+            "/usr/bin/imix",
+            "/usr/local/bin/imix",
+            "/tmp/imix",
+            "/var/tmp/imix",
+        ];
+        for path in bsd_install_paths {
+            let is_self = self_exe.as_deref().map_or(false, |s| {
+                std::path::Path::new(path)
+                    .canonicalize()
+                    .map_or(false, |p| p.to_string_lossy() == s)
+            });
+            if is_self {
+                continue;
+            }
+            if std::path::Path::new(path).exists() {
+                result.add_finding(Finding::new(
+                    "proc",
+                    "Realm C2 binary found at known install path",
+                    Tier::Tier1,
+                    format!("path={}", path),
+                ));
+                if !scanned_paths.contains(*path) {
+                    for f in scanner.scan_file(path) {
+                        result.add_finding(f);
+                    }
+                }
+            }
+        }
     }
 
     let _ = verbose; // suppress unused warning on platforms with no live proc scan

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::allowlist::Allowlist;
 use crate::Layer;
-use crate::output::{human, json};
+use crate::output::{human, json, syslog};
 use crate::{scan, Finding, ScanResult};
 
 struct DedupTracker {
@@ -46,7 +46,9 @@ pub fn run(
     interval_secs: u64,
     baseline_secs: Option<u64>,
     json_output: bool,
-    _allowlist: &Allowlist,
+    allowlist: &Allowlist,
+    syslog_enabled: bool,
+    webhook_url: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<i32> {
     let interval = Duration::from_secs(interval_secs);
@@ -61,7 +63,7 @@ pub fn run(
             eprintln!("Baselining for {}s...", baseline);
         }
         std::thread::sleep(Duration::from_secs(baseline));
-        let result = run_scan_layers(layer, verbose);
+        let result = run_scan_layers(layer, verbose, false);
         for finding in &result.findings {
             dedup.should_report(finding);
         }
@@ -70,8 +72,15 @@ pub fn run(
         }
     }
 
+    let mut memory_scan_counter: u64 = 0;
+    const MEMORY_SCAN_EVERY: u64 = 6;
+
     loop {
-        let result = run_scan_layers(layer, verbose);
+        let skip_memory = memory_scan_counter % MEMORY_SCAN_EVERY != 0;
+        memory_scan_counter += 1;
+
+        let mut result = run_scan_layers(layer, verbose, skip_memory);
+        result.filter(allowlist);
 
         for finding in &result.findings {
             if dedup.should_report(finding) {
@@ -79,6 +88,12 @@ pub fn run(
                     json::print_finding_line(finding);
                 } else {
                     human::print_alert(finding);
+                }
+                if syslog_enabled {
+                    syslog::send_to_syslog(finding);
+                }
+                if let Some(url) = webhook_url {
+                    syslog::send_to_webhook(finding, url);
                 }
             }
         }
@@ -88,7 +103,7 @@ pub fn run(
     }
 }
 
-fn run_scan_layers(layer: Option<&Layer>, verbose: bool) -> ScanResult {
+fn run_scan_layers(layer: Option<&Layer>, verbose: bool, skip_memory: bool) -> ScanResult {
     let mut result = ScanResult::new();
 
     let run_all = layer.is_none();
@@ -105,7 +120,7 @@ fn run_scan_layers(layer: Option<&Layer>, verbose: bool) -> ScanResult {
     if run_all || matches!(layer, Some(Layer::Behavior)) {
         result.merge(scan::behavior::scan(verbose));
     }
-    if run_all || matches!(layer, Some(Layer::Memory)) {
+    if !skip_memory && (run_all || matches!(layer, Some(Layer::Memory))) {
         result.merge(scan::memory::scan(verbose));
     }
 

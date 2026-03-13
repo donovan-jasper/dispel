@@ -120,6 +120,26 @@ fn is_common_port(port: u16) -> bool {
     )
 }
 
+/// Returns true if `ip` belongs to an RFC1918 / link-local / internal range.
+/// These connections are generally not C2 callback targets.
+fn is_internal_network(ip: &str) -> bool {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let Ok(a) = parts[0].parse::<u16>() else { return false; };
+    let Ok(b) = parts[1].parse::<u16>() else { return false; };
+
+    match a {
+        10 => true,                                    // 10.0.0.0/8
+        172 if (16..=31).contains(&b) => true,         // 172.16.0.0/12
+        192 if b == 168 => true,                       // 192.168.0.0/16
+        169 if b == 254 => true,                       // 169.254.0.0/16 link-local
+        127 => true,                                   // 127.0.0.0/8
+        _ => false,
+    }
+}
+
 // --- Active packet inspection ---
 
 /// Check raw payload bytes for Realm C2 gRPC paths or `application/grpc` content-type.
@@ -263,6 +283,7 @@ pub fn scan(verbose: bool) -> ScanResult {
             if conn.state == "ESTABLISHED"
                 && conn.remote_addr != "0.0.0.0"
                 && conn.remote_addr != "127.0.0.1"
+                && !is_internal_network(&conn.remote_addr)
                 && !is_common_port(conn.remote_port)
             {
                 result.add_finding(Finding::new(
@@ -318,8 +339,9 @@ fn scan_linux(result: &mut ScanResult, verbose: bool) {
                         continue;
                     }
 
-                    // Skip container/cluster infrastructure ranges.
-                    if is_container_network(&ip) {
+                    // Skip internal/private networks — too noisy on
+                    // k3s, Docker, and lab environments.
+                    if is_internal_network(&ip) || is_container_network(&ip) {
                         continue;
                     }
 
@@ -370,6 +392,15 @@ fn parse_proc_net_addr(hex: &str) -> Option<(String, u16)> {
         }
         if addr_hex == "00000000000000000000000000000000" {
             return Some((("::").to_string(), port));
+        }
+        // Check for IPv4-mapped IPv6: 0000000000000000FFFF0000 prefix
+        if addr_hex.starts_with("0000000000000000FFFF0000") {
+            let ipv4_hex = &addr_hex[24..32];
+            if let Ok(n) = u32::from_str_radix(ipv4_hex, 16) {
+                let b = n.to_le_bytes();
+                let ip = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+                return Some((ip, port));
+            }
         }
         Some((format!("ipv6:{addr_hex}"), port))
     } else {

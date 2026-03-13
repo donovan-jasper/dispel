@@ -63,7 +63,7 @@ pub fn print_alert(finding: &Finding) {
 
 /// Print an IR report in human-readable format.
 pub fn print_ir_report(report: &crate::ir::IrReport) {
-    use crate::ir::IrReport;
+    
 
     if report.implants.is_empty() {
         println!("  No implant binaries to report on.");

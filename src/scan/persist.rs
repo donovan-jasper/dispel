@@ -215,6 +215,11 @@ pub fn scan(verbose: bool) -> ScanResult {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
+                        // Skip cmd.exe itself — it's the reference file
+                        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if fname.eq_ignore_ascii_case("cmd.exe") {
+                            continue;
+                        }
                         if windows::check_timestomp(path.to_str().unwrap_or("")) {
                             result.add_finding(Finding::new(
                                 "persist",

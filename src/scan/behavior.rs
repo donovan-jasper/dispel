@@ -162,10 +162,95 @@ pub fn scan(verbose: bool) -> ScanResult {
         }
     }
 
-    // --- Windows stub ---
+    // --- Windows ---
     #[cfg(windows)]
     {
-        // TODO: check WMI for suspicious shell processes
+        use crate::{Finding, Tier};
+        use crate::platform::windows;
+
+        // Known legitimate parent processes for shell binaries on Windows
+        const EXPECTED_PARENTS: &[&str] = &[
+            "explorer.exe",
+            "services.exe",
+            "svchost.exe",
+            "winlogon.exe",
+            "userinit.exe",
+            "conhost.exe",
+        ];
+
+        // Windows shell binary names (lowercase for comparison)
+        const WIN_SHELLS: &[&str] = &[
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh.exe",
+        ];
+
+        let procs = windows::enumerate_processes();
+
+        // Build a PID -> process name lookup for parent process checks
+        let pid_to_name: std::collections::HashMap<u32, &str> = procs
+            .iter()
+            .map(|p| (p.pid, p.name.as_str()))
+            .collect();
+
+        // Get TCP connections for network socket checks
+        let connections = windows::read_tcp_connections();
+
+        for proc_info in &procs {
+            let lower_name = proc_info.name.to_lowercase();
+            if !WIN_SHELLS.contains(&lower_name.as_str()) {
+                continue;
+            }
+
+            // Check 1: Suspicious parent process
+            // PROCESSENTRY32 doesn't expose PPID directly through our ProcessInfo,
+            // so we rely on the network connection check below. For parent PID,
+            // we need to re-enumerate with parent tracking.
+            // For now, check if this shell PID has an ESTABLISHED connection
+            // to a non-loopback IP.
+
+            let shell_connections: Vec<&windows::WindowsTcpConnection> = connections
+                .iter()
+                .filter(|c| c.owning_pid == proc_info.pid && c.state == "ESTABLISHED")
+                .filter(|c| {
+                    // Filter to non-loopback remote addresses
+                    !c.remote_addr.starts_with("127.")
+                        && c.remote_addr != "0.0.0.0"
+                        && c.remote_addr != "::1"
+                        && c.remote_addr != "[::1]"
+                })
+                .collect();
+
+            if !shell_connections.is_empty() {
+                let remote_addrs: Vec<String> = shell_connections
+                    .iter()
+                    .map(|c| format!("{}:{}", c.remote_addr, c.remote_port))
+                    .collect();
+
+                if verbose {
+                    eprintln!(
+                        "[behavior] shell {} (PID {}) has external connections: {:?}",
+                        proc_info.name, proc_info.pid, remote_addrs
+                    );
+                }
+
+                result.add_finding(Finding::new(
+                    "behavior",
+                    "Shell process with external network connection (possible reverse shell)",
+                    Tier::Behavioral,
+                    format!(
+                        "pid={} proc={} remote={}",
+                        proc_info.pid,
+                        proc_info.name,
+                        remote_addrs.join(",")
+                    ),
+                ));
+            }
+        }
+
+        // Re-enumerate with parent PID tracking for suspicious parent detection
+        // Use CreateToolhelp32Snapshot which gives us th32ParentProcessID
+        check_shell_parents_windows(&procs, &pid_to_name, verbose, &mut result);
     }
 
     // --- BSD stub ---
@@ -177,4 +262,98 @@ pub fn scan(verbose: bool) -> ScanResult {
     let _ = verbose; // suppress unused warning when no platform matches
 
     result
+}
+
+/// Check shell processes for suspicious parent processes on Windows.
+/// Uses CreateToolhelp32Snapshot to get parent PIDs, then flags shells whose
+/// parent is not a known legitimate Windows process.
+#[cfg(windows)]
+fn check_shell_parents_windows(
+    procs: &[crate::platform::ProcessInfo],
+    pid_to_name: &std::collections::HashMap<u32, &str>,
+    verbose: bool,
+    result: &mut ScanResult,
+) {
+    use crate::{Finding, Tier};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    const EXPECTED_PARENTS: &[&str] = &[
+        "explorer.exe",
+        "services.exe",
+        "svchost.exe",
+        "winlogon.exe",
+        "userinit.exe",
+        "conhost.exe",
+        "wmiprvse.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "openssh.exe",
+        "sshd.exe",
+    ];
+
+    const WIN_SHELLS: &[&str] = &[
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+    ];
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return;
+        }
+
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+        if Process32First(snapshot, &mut entry) != 0 {
+            loop {
+                let name = entry
+                    .szExeFile
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8 as char)
+                    .collect::<String>();
+
+                let lower_name = name.to_lowercase();
+                if WIN_SHELLS.contains(&lower_name.as_str()) {
+                    let ppid = entry.th32ParentProcessID;
+                    let parent_name = pid_to_name
+                        .get(&ppid)
+                        .copied()
+                        .unwrap_or("unknown");
+                    let parent_lower = parent_name.to_lowercase();
+
+                    if !EXPECTED_PARENTS.contains(&parent_lower.as_str()) {
+                        if verbose {
+                            eprintln!(
+                                "[behavior] shell {} (PID {}) has unexpected parent {} (PID {})",
+                                name, entry.th32ProcessID, parent_name, ppid
+                            );
+                        }
+
+                        result.add_finding(Finding::new(
+                            "behavior",
+                            "Shell process with unexpected parent (possible implant-spawned shell)",
+                            Tier::Behavioral,
+                            format!(
+                                "pid={} proc={} ppid={} parent={}",
+                                entry.th32ProcessID, name, ppid, parent_name
+                            ),
+                        ));
+                    }
+                }
+
+                if Process32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+
+        CloseHandle(snapshot);
+    }
 }
