@@ -80,6 +80,7 @@ pub fn print_ir_report(report: &crate::ir::IrReport) {
             format!("--- Implant #{} ---", i + 1).red().bold(),
             implant.path.white().bold()
         );
+        println!("  {}", implant.summary_line().yellow().bold());
 
         // File info
         if let Some(ref fi) = implant.file_info {

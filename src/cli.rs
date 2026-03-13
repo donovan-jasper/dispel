@@ -34,6 +34,17 @@ pub enum Command {
         allowlist: Option<String>,
     },
 
+    /// Detect, quarantine, and remove Realm C2 implants.
+    Kill {
+        /// Show what would be done without making any changes.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Override the default quarantine directory (/var/lib/dispel/quarantine).
+        #[arg(long)]
+        quarantine_dir: Option<String>,
+    },
+
     /// Watch mode: continuously monitor for Realm C2 indicators.
     Watch {
         /// Limit watch to a specific layer (default: all layers).
@@ -75,6 +86,9 @@ impl Cli {
                     allowlist.as_deref(),
                     self.verbose,
                 )
+            }
+            Command::Kill { dry_run, quarantine_dir } => {
+                run_kill(*dry_run, quarantine_dir.as_deref(), self.verbose)
             }
         }
     }
@@ -137,6 +151,15 @@ fn run_scan(
     }
 
     Ok(result.exit_code())
+}
+
+fn run_kill(dry_run: bool, quarantine_dir: Option<&str>, verbose: bool) -> anyhow::Result<i32> {
+    use dispel::remediate::{KillConfig, run_kill as remediate_kill};
+    use std::path::PathBuf;
+
+    let qdir = quarantine_dir.map(PathBuf::from);
+    let cfg = KillConfig::new(dry_run, qdir, verbose);
+    remediate_kill(&cfg)
 }
 
 fn run_watch(

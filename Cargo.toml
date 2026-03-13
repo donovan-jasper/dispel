@@ -17,6 +17,9 @@ aho-corasick = "1"
 pnet = "0.35"
 anyhow = "1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_ToolHelp",

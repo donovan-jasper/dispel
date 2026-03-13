@@ -132,6 +132,9 @@ pub fn scan(verbose: bool) -> ScanResult {
     let mut result = ScanResult::new();
     let scanner = BinaryScanner::new();
     let self_exe = self_exe_path();
+    // Tracks exe paths already binary-scanned (live process scan) so the
+    // install-path section does not re-scan the same file.
+    let mut scanned_paths: HashSet<String> = HashSet::new();
 
     // --- Linux-specific live process scanning ---
     #[cfg(target_os = "linux")]
@@ -169,22 +172,41 @@ pub fn scan(verbose: bool) -> ScanResult {
                 ));
             }
 
-            // Binary scan of each live process executable (skip self)
+            // Binary scan of each live process executable (skip self).
+            // When the exe has been deleted from disk, scan via /proc/<pid>/exe
+            // (which remains readable) and rewrite the finding detail to show
+            // the original path instead of the /proc path.
             if let Some(ref exe) = proc.exe_path {
                 let is_self = self_exe.as_deref().map_or(false, |s| exe == s);
-                if !proc.deleted_exe && !is_self {
-                    let findings = scanner.scan_file(exe);
+                if !is_self {
+                    let scan_path = if proc.deleted_exe {
+                        format!("/proc/{}/exe", proc.pid)
+                    } else {
+                        exe.clone()
+                    };
+                    let mut findings = scanner.scan_file(&scan_path);
+                    if proc.deleted_exe {
+                        let proc_path_prefix = format!("path={}", scan_path);
+                        let real_path_detail = format!("path={} (deleted)", exe);
+                        for f in &mut findings {
+                            if f.detail == proc_path_prefix {
+                                f.detail = real_path_detail.clone();
+                            }
+                        }
+                    }
                     if verbose && !findings.is_empty() {
                         eprintln!(
-                            "[proc] {} finding(s) in pid={} exe={}",
+                            "[proc] {} finding(s) in pid={} exe={}{}",
                             findings.len(),
                             proc.pid,
-                            exe
+                            exe,
+                            if proc.deleted_exe { " (deleted)" } else { "" }
                         );
                     }
                     for f in findings {
                         result.add_finding(f);
                     }
+                    scanned_paths.insert(exe.clone());
                 }
             }
         }
@@ -210,9 +232,12 @@ pub fn scan(verbose: bool) -> ScanResult {
                     Tier::Tier1,
                     format!("path={}", path),
                 ));
-                // Also do binary scan for additional evidence
-                for f in scanner.scan_file(path) {
-                    result.add_finding(f);
+                // Also do binary scan for additional evidence, but skip if the
+                // path was already scanned as a live process exe.
+                if !scanned_paths.contains(*path) {
+                    for f in scanner.scan_file(path) {
+                        result.add_finding(f);
+                    }
                 }
             }
         }
@@ -264,6 +289,7 @@ pub fn scan(verbose: bool) -> ScanResult {
                     for f in scanner.scan_file(path) {
                         result.add_finding(f);
                     }
+                    scanned_paths.insert(path.clone());
                 }
             }
         }
@@ -276,8 +302,11 @@ pub fn scan(verbose: bool) -> ScanResult {
                     Tier::Tier1,
                     path.to_string(),
                 ));
-                for f in scanner.scan_file(path) {
-                    result.add_finding(f);
+                // Skip binary scan if already scanned as a live process exe.
+                if !scanned_paths.contains(*path) {
+                    for f in scanner.scan_file(path) {
+                        result.add_finding(f);
+                    }
                 }
             }
         }

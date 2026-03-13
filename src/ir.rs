@@ -84,6 +84,35 @@ pub struct PersistenceDetail {
     pub detail: String,
 }
 
+impl ImplantReport {
+    /// Returns a single-line summary of this implant for quick triage.
+    pub fn summary_line(&self) -> String {
+        let callback = self
+            .extracted_config
+            .as_ref()
+            .and_then(|c| c.callback_uris.first())
+            .map(|s| s.as_str())
+            .unwrap_or("(no callback found)");
+
+        let (user, pid) = self
+            .processes
+            .first()
+            .map(|p| (p.user.as_str(), p.pid))
+            .unwrap_or(("unknown", 0));
+
+        let installed = self
+            .file_info
+            .as_ref()
+            .map(|fi| fi.created.as_str())
+            .unwrap_or("unknown");
+
+        format!(
+            "Realm C2 implant (imix) at {} -> {}, running as {} (PID {}), installed {}",
+            self.path, callback, user, pid, installed
+        )
+    }
+}
+
 /// Extract unique binary paths from proc-layer findings.
 fn extract_implant_paths(result: &ScanResult) -> Vec<String> {
     let mut paths = HashSet::new();

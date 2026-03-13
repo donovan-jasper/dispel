@@ -5,6 +5,7 @@ pub mod platform;
 pub mod allowlist;
 pub mod watch;
 pub mod ir;
+pub mod remediate;
 
 use serde::{Deserialize, Serialize};
 

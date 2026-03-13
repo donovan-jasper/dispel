@@ -88,6 +88,27 @@ impl Default for ConnectionTracker {
     }
 }
 
+// --- Container network filter ---
+
+/// Returns true if `ip` falls within a known container/cluster infrastructure
+/// range that should not be flagged as suspicious:
+///   10.42.0.0/16  — k3s pod CIDR
+///   10.43.0.0/16  — k3s service CIDR
+///   172.17.0.0/16 — Docker default bridge
+fn is_container_network(ip: &str) -> bool {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let Ok(a) = parts[0].parse::<u16>() else { return false; };
+    let Ok(b) = parts[1].parse::<u16>() else { return false; };
+
+    match (a, b) {
+        (10, 42) | (10, 43) | (172, 17) => true,
+        _ => false,
+    }
+}
+
 // --- Common port helper ---
 
 /// Returns true if `port` is a well-known / commonly-allowed port that should
@@ -283,9 +304,22 @@ fn scan_linux(result: &mut ScanResult, verbose: bool) {
                 }
 
                 let remote_hex = fields[2];
+                // Skip IPv6-mapped loopback ::ffff:127.0.0.1
+                // (stored as 0000000000000000FFFF00000100007F in /proc/net/tcp6).
+                if remote_hex == "0000000000000000FFFF00000100007F:0000"
+                    || remote_hex.starts_with("0000000000000000FFFF00000100007F:")
+                {
+                    continue;
+                }
+
                 if let Some((ip, port)) = parse_proc_net_addr(remote_hex) {
                     // Skip loopback and wildcard.
                     if ip == "127.0.0.1" || ip == "0.0.0.0" || ip == "::1" || ip == "::" {
+                        continue;
+                    }
+
+                    // Skip container/cluster infrastructure ranges.
+                    if is_container_network(&ip) {
                         continue;
                     }
 
