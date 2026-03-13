@@ -25,33 +25,23 @@ pub const ELDRITCH_DISTINCTIVE: &[&str] = &[
 ];
 
 /// Eldritch agent API surface — functions exported by the imix agent runtime.
+/// Only includes names distinctive enough to avoid false positives in system binaries.
 pub const ELDRITCH_AGENT_API: &[&str] = &[
     "report_credential",
     "report_process_list",
     "report_task_output",
-    "claim_tasks",
-    "fetch_asset",
-    "report_file",
     "get_callback_interval",
     "set_callback_interval",
     "set_callback_uri",
-    "list_transports",
-    "get_transport",
-    "list_tasks",
-    "stop_task",
-    "get_config",
 ];
 
 /// Eldritch offensive capability function names.
+/// Removed short/generic strings (ncat, arp_scan, port_scan) that match in legitimate binaries.
+/// reverse_shell_pty/repl already in ELDRITCH_DISTINCTIVE.
 pub const ELDRITCH_OFFENSIVE: &[&str] = &[
-    "arp_scan",
-    "port_scan",
-    "ncat",
     "create_portal",
     "ssh_exec",
     "ssh_copy",
-    "reverse_shell_pty",
-    "reverse_shell_repl",
 ];
 
 /// Eldritch report module function signatures.
@@ -67,18 +57,16 @@ pub const ELDRITCH_REPORT: &[&str] = &[
 // --- Tier 2: Strong indicators ---
 
 /// Rust module path strings and protobuf type names found in Realm C2 binaries.
+/// Removed generic strings (ProcessList, FileMetadata, realm::, DnsPacket) that
+/// match in legitimate binaries like systemd, k3s, docker, etc.
 pub const TIER2_STRINGS: &[&str] = &[
     "imix-v",
     "imix::",
     "eldritch::",
-    "realm::",
-    "ProcessList",
-    "FileMetadata",
     "Credential_Kind",
     "KIND_NTLM_HASH",
     "KIND_SSH_KEY",
     "KIND_PASSWORD",
-    "DnsPacket",
     "ChachaCodec",
 ];
 
@@ -178,15 +166,10 @@ pub fn all_signatures() -> Vec<(&'static str, Tier)> {
     for &s in TIER2_STRINGS {
         sigs.push((s, Tier::Tier2));
     }
-    for &s in TIER1_BINARY_NAMES {
-        sigs.push((s, Tier::Tier1));
-    }
-    for &s in TIER1_SERVICE_NAMES {
-        sigs.push((s, Tier::Tier1));
-    }
-    for &s in TIER1_INSTALL_PATHS_LINUX {
-        sigs.push((s, Tier::Tier1));
-    }
+    // NOTE: TIER1_BINARY_NAMES, TIER1_SERVICE_NAMES, and TIER1_INSTALL_PATHS_LINUX
+    // are intentionally excluded from binary content scanning. They are too short/generic
+    // ("imix" = 4 chars) and cause massive false positives. They are only used for
+    // process name matching and file path existence checks in scan/proc.rs.
 
     sigs
 }

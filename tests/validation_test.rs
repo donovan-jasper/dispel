@@ -1,12 +1,12 @@
 //! Validation tests: simulate Realm C2 implant artifacts and verify detection.
 //!
 //! These tests create synthetic files containing real Realm C2 signatures
-//! and verify that realm-detect catches them across all detection layers.
+//! and verify that dispel catches them across all detection layers.
 
-use realm_detect::scan::proc::BinaryScanner;
-use realm_detect::scan::persist;
-use realm_detect::scan::net;
-use realm_detect::Tier;
+use dispel::scan::proc::BinaryScanner;
+use dispel::scan::persist;
+use dispel::scan::net;
+use dispel::Tier;
 use std::io::Write;
 
 // ---------------------------------------------------------------------------
@@ -35,13 +35,13 @@ fn make_fake_implant() -> Vec<u8> {
     // Tier 3: Eldritch agent API
     payload.extend_from_slice(b"report_credential");
     payload.extend_from_slice(&[0u8; 50]);
-    payload.extend_from_slice(b"claim_tasks");
+    payload.extend_from_slice(b"set_callback_interval");
     payload.extend_from_slice(&[0u8; 50]);
 
     // Tier 3: Eldritch offensive
-    payload.extend_from_slice(b"arp_scan");
+    payload.extend_from_slice(b"ssh_exec");
     payload.extend_from_slice(&[0u8; 50]);
-    payload.extend_from_slice(b"port_scan");
+    payload.extend_from_slice(b"create_portal");
     payload.extend_from_slice(&[0u8; 50]);
 
     // Tier 2 strings
@@ -90,8 +90,8 @@ fn binary_scanner_detects_eldritch_functions() {
         .collect();
 
     assert!(
-        eldritch_findings.len() >= 5,
-        "Expected at least 5 Eldritch findings, got {}: {:?}",
+        eldritch_findings.len() >= 4,
+        "Expected at least 4 Eldritch findings, got {}: {:?}",
         eldritch_findings.len(),
         eldritch_findings.iter().map(|f| &f.description).collect::<Vec<_>>()
     );
@@ -255,7 +255,7 @@ fn full_scan_json_output_is_valid() {
         .args(["run", "--release", "--", "scan", "--json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run realm-detect");
+        .expect("Failed to run dispel");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =

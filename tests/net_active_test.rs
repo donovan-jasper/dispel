@@ -1,5 +1,5 @@
-use realm_detect::scan::net::{check_grpc_payload, check_dns_c2_query, check_encrypted_prefix};
-use realm_detect::Tier;
+use dispel::scan::net::{check_grpc_payload, check_dns_c2_query, check_encrypted_prefix};
+use dispel::Tier;
 
 // --- gRPC payload tests ---
 

@@ -53,7 +53,7 @@ pub fn run(
     let mut dedup = DedupTracker::new();
 
     if !json_output {
-        eprintln!("realm-detect watch mode (interval={}s, Ctrl+C to stop)", interval_secs);
+        eprintln!("dispel watch mode (interval={}s, Ctrl+C to stop)", interval_secs);
     }
 
     if let Some(baseline) = baseline_secs {

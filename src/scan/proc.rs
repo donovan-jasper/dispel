@@ -118,16 +118,25 @@ impl Default for BinaryScanner {
 // Task 8: top-level proc scan entry point
 // ---------------------------------------------------------------------------
 
+/// Get the path of the current executable, used to skip self-scanning.
+fn self_exe_path() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 /// Scan process layer and return accumulated findings.
 #[allow(unused_mut, unused_variables)]
 pub fn scan(verbose: bool) -> ScanResult {
     let mut result = ScanResult::new();
     let scanner = BinaryScanner::new();
+    let self_exe = self_exe_path();
 
     // --- Linux-specific live process scanning ---
     #[cfg(target_os = "linux")]
     {
-        use crate::platform::linux::{enumerate_processes, ProcessInfo};
+        use crate::platform::linux::enumerate_processes;
 
         let procs = enumerate_processes();
 
@@ -160,9 +169,10 @@ pub fn scan(verbose: bool) -> ScanResult {
                 ));
             }
 
-            // Binary scan of each live process executable
+            // Binary scan of each live process executable (skip self)
             if let Some(ref exe) = proc.exe_path {
-                if !proc.deleted_exe {
+                let is_self = self_exe.as_deref().map_or(false, |s| exe == s);
+                if !proc.deleted_exe && !is_self {
                     let findings = scanner.scan_file(exe);
                     if verbose && !findings.is_empty() {
                         eprintln!(
@@ -184,6 +194,14 @@ pub fn scan(verbose: bool) -> ScanResult {
     #[cfg(target_os = "linux")]
     {
         for path in TIER1_INSTALL_PATHS_LINUX {
+            let is_self = self_exe.as_deref().map_or(false, |s| {
+                std::path::Path::new(path)
+                    .canonicalize()
+                    .map_or(false, |p| p.to_string_lossy() == s)
+            });
+            if is_self {
+                continue;
+            }
             if std::path::Path::new(path).exists() {
                 // Report presence as Tier1 finding even before scanning bytes
                 result.add_finding(Finding::new(
@@ -241,8 +259,11 @@ pub fn scan(verbose: bool) -> ScanResult {
             }
 
             if let Some(ref path) = proc_info.exe_path {
-                for f in scanner.scan_file(path) {
-                    result.add_finding(f);
+                let is_self = self_exe.as_deref().map_or(false, |s| path == s);
+                if !is_self {
+                    for f in scanner.scan_file(path) {
+                        result.add_finding(f);
+                    }
                 }
             }
         }

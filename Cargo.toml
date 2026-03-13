@@ -1,8 +1,8 @@
 [package]
-name = "realm-detect"
+name = "dispel"
 version = "0.1.0"
 edition = "2021"
-description = "Realm C2 detection tool for CCDC blue team operations"
+description = "Dispel the darkness — Realm C2 detection for CCDC blue team operations"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

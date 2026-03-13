@@ -6,7 +6,7 @@ fn test_scan_runs_and_produces_json() {
         .args(["run", "--", "scan", "--json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run realm-detect");
+        .expect("Failed to run dispel");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("Invalid JSON output");
@@ -21,7 +21,7 @@ fn test_scan_proc_layer_only() {
         .args(["run", "--", "scan", "--layer", "proc", "--json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run realm-detect");
+        .expect("Failed to run dispel");
 
     // Exit code 0 (clean) or scan completed
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -34,8 +34,8 @@ fn test_help_flag() {
         .args(["run", "--", "--help"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
-        .expect("Failed to run realm-detect");
+        .expect("Failed to run dispel");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("realm-detect") || stdout.contains("Realm"));
+    assert!(stdout.contains("dispel") || stdout.contains("Realm"));
 }

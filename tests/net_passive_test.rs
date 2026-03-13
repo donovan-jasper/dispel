@@ -1,4 +1,4 @@
-use realm_detect::scan::net::ConnectionTracker;
+use dispel::scan::net::ConnectionTracker;
 
 /// A perfect 5-second beacon (4 samples) should be detected with 1-second tolerance.
 #[test]

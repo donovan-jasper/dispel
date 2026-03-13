@@ -1,4 +1,4 @@
-use realm_detect::{Finding, ScanResult, Tier};
+use dispel::{Finding, ScanResult, Tier};
 
 #[test]
 fn test_json_output_structure() {

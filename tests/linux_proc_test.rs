@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 mod linux_tests {
-    use realm_detect::platform::linux::enumerate_processes;
+    use dispel::platform::linux::enumerate_processes;
 
     #[test]
     fn enumerate_processes_returns_non_empty() {
@@ -49,6 +49,6 @@ mod linux_tests {
     #[test]
     fn read_tcp_connections_does_not_panic() {
         // Just verify it runs without panicking; /proc/net/tcp may or may not exist
-        let _conns = realm_detect::platform::linux::read_tcp_connections();
+        let _conns = dispel::platform::linux::read_tcp_connections();
     }
 }

@@ -1,5 +1,5 @@
-use realm_detect::scan::proc::BinaryScanner;
-use realm_detect::Tier;
+use dispel::scan::proc::BinaryScanner;
+use dispel::Tier;
 
 fn scanner() -> BinaryScanner {
     BinaryScanner::new()

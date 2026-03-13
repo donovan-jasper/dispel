@@ -1,4 +1,4 @@
-use realm_detect::scan::persist::{check_uuid_file, is_uuid_v4};
+use dispel::scan::persist::{check_uuid_file, is_uuid_v4};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -89,7 +89,7 @@ fn test_uuid_file_valid_detection() {
 
     let finding = finding.unwrap();
     assert_eq!(finding.layer, "persist");
-    assert_eq!(finding.tier, realm_detect::Tier::Tier2);
+    assert_eq!(finding.tier, dispel::Tier::Tier2);
     assert!(finding.detail.contains("550e8400-e29b-41d4-a716-446655440000"));
 }
 

@@ -1,4 +1,4 @@
-use realm_detect::scan::behavior::is_shell_binary;
+use dispel::scan::behavior::is_shell_binary;
 
 // ---------------------------------------------------------------------------
 // is_shell_binary — positive cases
@@ -84,8 +84,8 @@ fn test_is_shell_binary_nginx_rejected() {
 
 #[cfg(target_os = "linux")]
 mod linux_behavior {
-    use realm_detect::scan::behavior::check_fd_redirected_to_socket;
-    use realm_detect::Tier;
+    use dispel::scan::behavior::check_fd_redirected_to_socket;
+    use dispel::Tier;
 
     #[test]
     fn test_shell_with_socket_fd_detected() {

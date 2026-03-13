@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use realm_detect::Layer;
+use dispel::Layer;
 
 /// Realm C2 detection tool for CCDC blue team operations.
 #[derive(Debug, Parser)]
-#[command(name = "realm-detect", version, about)]
+#[command(name = "dispel", version, about)]
 pub struct Cli {
     /// Enable verbose output.
     #[arg(short, long, global = true)]
@@ -82,10 +82,10 @@ fn run_scan(
     allowlist_path: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<i32> {
-    use realm_detect::allowlist::Allowlist;
-    use realm_detect::output;
-    use realm_detect::scan;
-    use realm_detect::{Layer, ScanResult};
+    use dispel::allowlist::Allowlist;
+    use dispel::output;
+    use dispel::scan;
+    use dispel::{Layer, ScanResult};
 
     let _allowlist = match allowlist_path {
         Some(path) => Allowlist::from_file(path)?,
@@ -129,8 +129,8 @@ fn run_watch(
     allowlist_path: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<i32> {
-    use realm_detect::allowlist::Allowlist;
-    use realm_detect::watch;
+    use dispel::allowlist::Allowlist;
+    use dispel::watch;
 
     let allowlist = match allowlist_path {
         Some(path) => Allowlist::from_file(path)?,

@@ -1,4 +1,4 @@
-use realm_detect::allowlist::Allowlist;
+use dispel::allowlist::Allowlist;
 
 #[test]
 fn test_parse_allowlist() {

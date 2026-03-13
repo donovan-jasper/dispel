@@ -1,9 +1,9 @@
-use realm_detect::signatures::strings::{
+use dispel::signatures::strings::{
     GRPC_PATHS, ELDRITCH_DISTINCTIVE, ELDRITCH_AGENT_API,
     TIER2_STRINGS, TIER1_BINARY_NAMES, TIER1_SERVICE_NAMES,
     TIER1_INSTALL_PATHS_LINUX, all_signatures,
 };
-use realm_detect::Tier;
+use dispel::Tier;
 
 #[test]
 fn test_grpc_paths_count() {
@@ -24,19 +24,14 @@ fn test_eldritch_distinctive_contains_clowntown() {
 
 #[test]
 fn test_eldritch_agent_api_completeness() {
+    // Only distinctive API strings are kept; generic ones removed to avoid false positives
     let expected = &[
         "report_credential",
         "report_process_list",
-        "claim_tasks",
-        "fetch_asset",
+        "report_task_output",
         "get_callback_interval",
         "set_callback_interval",
         "set_callback_uri",
-        "list_transports",
-        "get_transport",
-        "list_tasks",
-        "stop_task",
-        "get_config",
     ];
     for s in expected {
         assert!(
@@ -44,6 +39,7 @@ fn test_eldritch_agent_api_completeness() {
             "Missing agent API string: {s}"
         );
     }
+    assert_eq!(ELDRITCH_AGENT_API.len(), expected.len());
 }
 
 #[test]
@@ -51,11 +47,12 @@ fn test_tier2_strings_present() {
     assert!(TIER2_STRINGS.contains(&"imix-v"));
     assert!(TIER2_STRINGS.contains(&"eldritch::"));
     assert!(TIER2_STRINGS.contains(&"ChachaCodec"));
-    assert!(TIER2_STRINGS.contains(&"DnsPacket"));
+    assert!(TIER2_STRINGS.contains(&"Credential_Kind"));
 }
 
 #[test]
 fn test_tier1_constants() {
+    // These are used for name-based checks, NOT binary content scanning
     assert!(TIER1_BINARY_NAMES.contains(&"imix"));
     assert!(TIER1_BINARY_NAMES.contains(&"imix.exe"));
     assert!(TIER1_SERVICE_NAMES.contains(&"imix"));
@@ -89,9 +86,9 @@ fn test_all_signatures_tiers() {
         "All TIER2_STRINGS should appear as Tier2"
     );
 
-    // Binary names should be Tier1
+    // TIER1 names should NOT be in all_signatures (they cause false positives in binary scanning)
     for name in TIER1_BINARY_NAMES {
-        let found = sigs.iter().any(|(s, t)| s == name && *t == Tier::Tier1);
-        assert!(found, "Binary name {name} not found as Tier1");
+        let found = sigs.iter().any(|(s, _)| s == name);
+        assert!(!found, "Binary name {name} should NOT be in binary scanner signatures");
     }
 }

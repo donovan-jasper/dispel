@@ -1,4 +1,4 @@
-use realm_detect::{Finding, ScanResult, Severity, Tier};
+use dispel::{Finding, ScanResult, Severity, Tier};
 
 fn make_finding(tier: Tier) -> Finding {
     Finding::new("test", "test finding", tier, "detail")
