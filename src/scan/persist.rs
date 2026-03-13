@@ -181,7 +181,55 @@ pub fn scan(verbose: bool) -> ScanResult {
     // --- Windows ---
     #[cfg(windows)]
     {
-        // TODO: check Windows registry for imix persistence keys
+        use crate::platform::windows;
+        use crate::signatures::strings::BEACON_ID_PATHS_WINDOWS;
+
+        // Check beacon ID paths
+        for path in BEACON_ID_PATHS_WINDOWS {
+            if let Some(finding) = check_uuid_file(path) {
+                if verbose {
+                    eprintln!("[persist] beacon ID found at {}", path);
+                }
+                result.add_finding(finding);
+            }
+        }
+
+        // Registry check
+        for finding in windows::check_registry_imix() {
+            result.add_finding(finding);
+        }
+
+        // Service check
+        for finding in windows::check_windows_services() {
+            result.add_finding(finding);
+        }
+
+        // Timestomp check on system directories
+        let system_paths = [
+            r"C:\Windows\System32",
+            r"C:\Windows\SysWOW64",
+            r"C:\Windows\Temp",
+        ];
+        for dir in &system_paths {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if windows::check_timestomp(path.to_str().unwrap_or("")) {
+                            result.add_finding(Finding::new(
+                                "persist",
+                                format!(
+                                    "Binary timestomped to match cmd.exe: {}",
+                                    path.display()
+                                ),
+                                Tier::Tier2,
+                                path.display().to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let _ = verbose; // suppress unused warning when no platform block matches

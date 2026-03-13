@@ -200,11 +200,66 @@ pub fn scan(verbose: bool) -> ScanResult {
         }
     }
 
-    // --- Windows stub ---
+    // --- Windows ---
     #[cfg(windows)]
     {
-        let _ = verbose;
-        // TODO: enumerate Windows processes via ToolHelp32
+        use crate::platform::windows;
+        use crate::signatures::strings;
+
+        let procs = windows::enumerate_processes();
+        if verbose {
+            eprintln!("[verbose] Found {} Windows processes", procs.len());
+        }
+
+        for proc_info in &procs {
+            if proc_info.thread_count > 50 {
+                result.add_finding(Finding::new(
+                    "proc",
+                    format!(
+                        "Process {} (PID {}) has {} threads",
+                        proc_info.name, proc_info.pid, proc_info.thread_count
+                    ),
+                    Tier::Behavioral,
+                    proc_info.exe_path.clone().unwrap_or_default(),
+                ));
+            }
+
+            let lower_name = proc_info.name.to_lowercase();
+            if strings::TIER1_BINARY_NAMES
+                .iter()
+                .any(|n| lower_name == *n)
+            {
+                result.add_finding(Finding::new(
+                    "proc",
+                    format!(
+                        "Process named '{}' matches known imix name",
+                        proc_info.name
+                    ),
+                    Tier::Tier1,
+                    proc_info.exe_path.clone().unwrap_or_default(),
+                ));
+            }
+
+            if let Some(ref path) = proc_info.exe_path {
+                for f in scanner.scan_file(path) {
+                    result.add_finding(f);
+                }
+            }
+        }
+
+        for path in strings::TIER1_INSTALL_PATHS_WINDOWS {
+            if std::path::Path::new(path).exists() {
+                result.add_finding(Finding::new(
+                    "proc",
+                    format!("Known imix install path exists: {}", path),
+                    Tier::Tier1,
+                    path.to_string(),
+                ));
+                for f in scanner.scan_file(path) {
+                    result.add_finding(f);
+                }
+            }
+        }
     }
 
     // --- BSD stub ---

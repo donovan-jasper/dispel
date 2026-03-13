@@ -25,7 +25,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Path to allowlist file (YAML or JSON).
+        /// Path to allowlist file.
         #[arg(long)]
         allowlist: Option<String>,
     },
@@ -48,7 +48,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Path to allowlist file (YAML or JSON).
+        /// Path to allowlist file.
         #[arg(long)]
         allowlist: Option<String>,
     },
@@ -62,10 +62,11 @@ impl Cli {
                 run_scan(layer.as_ref(), *json, allowlist.as_deref(), self.verbose)
             }
             Command::Watch { layer, interval, baseline, json, allowlist } => {
+                let baseline_secs = baseline.as_deref().and_then(|b| b.parse::<u64>().ok());
                 run_watch(
                     layer.as_ref(),
                     *interval,
-                    baseline.as_deref(),
+                    baseline_secs,
                     *json,
                     allowlist.as_deref(),
                     self.verbose,
@@ -78,31 +79,37 @@ impl Cli {
 fn run_scan(
     layer: Option<&Layer>,
     json: bool,
-    _allowlist: Option<&str>,
+    allowlist_path: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<i32> {
+    use realm_detect::allowlist::Allowlist;
     use realm_detect::output;
     use realm_detect::scan;
     use realm_detect::{Layer, ScanResult};
 
-    let mut result = ScanResult::new();
+    let _allowlist = match allowlist_path {
+        Some(path) => Allowlist::from_file(path)?,
+        None => Allowlist::new(),
+    };
 
+    if verbose {
+        eprintln!("[verbose] Starting scan, layer: {:?}", layer);
+    }
+
+    let mut result = ScanResult::new();
     let run_all = layer.is_none();
 
     if run_all || matches!(layer, Some(Layer::Proc)) {
         result.merge(scan::proc::scan(verbose));
     }
-
     if run_all || matches!(layer, Some(Layer::Net)) {
-        // TODO: scan::net::scan(verbose)
+        result.merge(scan::net::scan(verbose));
     }
-
     if run_all || matches!(layer, Some(Layer::Persist)) {
-        // TODO: scan::persist::scan(verbose)
+        result.merge(scan::persist::scan(verbose));
     }
-
     if run_all || matches!(layer, Some(Layer::Behavior)) {
-        // TODO: scan::behavior::scan(verbose)
+        result.merge(scan::behavior::scan(verbose));
     }
 
     if json {
@@ -115,13 +122,20 @@ fn run_scan(
 }
 
 fn run_watch(
-    _layer: Option<&Layer>,
-    _interval: u64,
-    _baseline: Option<&str>,
-    _json: bool,
-    _allowlist: Option<&str>,
-    _verbose: bool,
+    layer: Option<&Layer>,
+    interval: u64,
+    baseline: Option<u64>,
+    json: bool,
+    allowlist_path: Option<&str>,
+    verbose: bool,
 ) -> anyhow::Result<i32> {
-    println!("Watch mode not yet implemented");
-    Ok(3)
+    use realm_detect::allowlist::Allowlist;
+    use realm_detect::watch;
+
+    let allowlist = match allowlist_path {
+        Some(path) => Allowlist::from_file(path)?,
+        None => Allowlist::new(),
+    };
+
+    watch::run(layer, interval, baseline, json, &allowlist, verbose)
 }

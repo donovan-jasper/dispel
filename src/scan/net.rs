@@ -229,7 +229,35 @@ pub fn scan(verbose: bool) -> ScanResult {
         scan_linux(&mut result, verbose);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use crate::platform::windows;
+
+        let connections = windows::read_tcp_connections();
+        if verbose {
+            eprintln!("[verbose] Found {} TCP connections", connections.len());
+        }
+
+        for conn in &connections {
+            if conn.state == "ESTABLISHED"
+                && conn.remote_addr != "0.0.0.0"
+                && conn.remote_addr != "127.0.0.1"
+                && !is_common_port(conn.remote_port)
+            {
+                result.add_finding(Finding::new(
+                    "net",
+                    format!(
+                        "Outbound to non-standard port {}:{} (PID {})",
+                        conn.remote_addr, conn.remote_port, conn.owning_pid
+                    ),
+                    Tier::Tier1,
+                    format!("local={}:{}", conn.local_addr, conn.local_port),
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = verbose; // suppress unused-variable warning
     }
