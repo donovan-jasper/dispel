@@ -2,7 +2,7 @@
 name = "dispel"
 version = "0.1.0"
 edition = "2021"
-description = "Dispel the darkness — Realm C2 detection for CCDC blue team operations"
+description = "Break the enchantment — detect and remove Realm C2 implants"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
